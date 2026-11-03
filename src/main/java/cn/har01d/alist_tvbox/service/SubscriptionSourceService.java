@@ -1,0 +1,443 @@
+package cn.har01d.alist_tvbox.service;
+
+import cn.har01d.alist_tvbox.config.AppProperties;
+import cn.har01d.alist_tvbox.entity.EmbyRepository;
+import cn.har01d.alist_tvbox.entity.FeiniuRepository;
+import cn.har01d.alist_tvbox.entity.JellyfinRepository;
+import cn.har01d.alist_tvbox.entity.Plugin;
+import cn.har01d.alist_tvbox.entity.PluginRepository;
+import cn.har01d.alist_tvbox.entity.Setting;
+import cn.har01d.alist_tvbox.entity.SettingRepository;
+import cn.har01d.alist_tvbox.entity.Site;
+import cn.har01d.alist_tvbox.entity.SiteRepository;
+import cn.har01d.alist_tvbox.exception.NotFoundException;
+import cn.har01d.alist_tvbox.model.BuiltinSubscriptionSourceState;
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import jakarta.annotation.PostConstruct;
+import org.apache.commons.lang3.StringUtils;
+import org.springframework.stereotype.Service;
+
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+
+@Service
+public class SubscriptionSourceService {
+    private static final String BUILTIN_SETTINGS_KEY = "builtin_subscription_sources";
+    private static final String SORT_ORDER_MIGRATED_KEY = "subscription_source_sort_order_migrated";
+    private static final String WEB_PAGES_FRONT_MIGRATED = "web_pages_front_migrated";
+    private static final Set<String> EXTENDABLE_BUILTINS =
+            Set.of("csp_PianDan", "csp_FishPanSou", "csp_FishPanSouGroup");
+
+    private final AppProperties appProperties;
+    private final PluginRepository pluginRepository;
+    private final SettingRepository settingRepository;
+    private final SiteRepository siteRepository;
+    private final EmbyRepository embyRepository;
+    private final FeiniuRepository feiniuRepository;
+    private final JellyfinRepository jellyfinRepository;
+    private final ObjectMapper objectMapper;
+
+    public SubscriptionSourceService(AppProperties appProperties,
+                                     PluginRepository pluginRepository,
+                                     SettingRepository settingRepository,
+                                     SiteRepository siteRepository,
+                                     EmbyRepository embyRepository,
+                                     FeiniuRepository feiniuRepository,
+                                     JellyfinRepository jellyfinRepository,
+                                     ObjectMapper objectMapper) {
+        this.appProperties = appProperties;
+        this.pluginRepository = pluginRepository;
+        this.settingRepository = settingRepository;
+        this.siteRepository = siteRepository;
+        this.embyRepository = embyRepository;
+        this.feiniuRepository = feiniuRepository;
+        this.jellyfinRepository = jellyfinRepository;
+        this.objectMapper = objectMapper;
+    }
+
+    public record ManagedSource(
+            String id,
+            boolean builtin,
+            Integer pluginId,
+            String key,
+            String name,
+            String sourceName,
+            String url,
+            boolean enabled,
+            boolean t4Visible,
+            Boolean detailEnhance,
+            int sortOrder,
+            Integer version,
+            String extend,
+            String lastCheckedAt,
+            String lastError,
+            boolean deletable,
+            boolean refreshable,
+            boolean extendable
+    ) {
+    }
+
+    /** t4Visible 可空 = 保持不变(QQ 扫码对话框等调用方只传 name/enabled/extend)。
+     *  detailEnhance 三态字符串:"on"=强制增强 / "off"=永不增强 / "default"=跟随全局+自动检测;null=保持不变
+     *  (用字符串而非 Boolean:显式恢复默认须与「未提供」区分,null 无法同时表达两者)。 */
+    public record ManagedSourceUpdate(String name, boolean enabled, Boolean t4Visible, String detailEnhance, String extend) {
+    }
+
+    public record SubscriptionSourceRef(String id, boolean builtin, String siteKey, String name, Plugin plugin) {
+    }
+
+    private record BuiltinDefinition(String siteKey, String defaultName, int defaultSortOrder) {
+    }
+
+    private record ManagedSourceHolder(ManagedSource source, Plugin plugin) {
+    }
+
+    @PostConstruct
+    void migratePluginSortOrders() {
+        if (settingRepository.existsByName(SORT_ORDER_MIGRATED_KEY)) {
+            return;
+        }
+        List<Plugin> plugins = pluginRepository.findAllByOrderBySortOrderAscIdAsc();
+        int offset = builtinDefinitions().size();
+        if (!plugins.isEmpty()) {
+            int order = offset + 1;
+            for (Plugin plugin : plugins) {
+                plugin.setSortOrder(order++);
+            }
+            pluginRepository.saveAll(plugins);
+        }
+        settingRepository.save(new Setting(SORT_ORDER_MIGRATED_KEY, "true"));
+    }
+
+    public List<ManagedSource> findAll() {
+        return buildManagedSources().stream()
+                .map(ManagedSourceHolder::source)
+                .toList();
+    }
+
+    public List<SubscriptionSourceRef> findEnabledSources() {
+        return buildManagedSources().stream()
+                .filter(item -> item.source().enabled())
+                .map(item -> new SubscriptionSourceRef(
+                        item.source().id(),
+                        item.source().builtin(),
+                        item.source().key(),
+                        item.source().name(),
+                        item.plugin()
+                ))
+                .toList();
+    }
+
+    /**
+     * T4 接口不可见的源站点 key 集(订阅源管理「T4」开关关闭者):内置源 = siteKey
+     * (与下发的 csp_* 站点 key/api 同值),插件源 = pluginSiteKey(与配置站点 key 同源)。
+     * applyT4 据此把命中站点从 T4 配置删除;T3 订阅不受影响。
+     */
+    public Set<String> t4HiddenSiteKeys() {
+        Set<String> keys = new HashSet<>();
+        for (ManagedSourceHolder item : buildManagedSources()) {
+            if (item.source().t4Visible()) {
+                continue;
+            }
+            if (item.source().builtin()) {
+                keys.add(item.source().key());
+            } else if (item.plugin() != null) {
+                keys.add(SubscriptionService.pluginSiteKey(item.plugin()));
+            }
+        }
+        return keys;
+    }
+
+    public ManagedSource update(String id, ManagedSourceUpdate update) {
+        if (id.startsWith("builtin-")) {
+            String siteKey = id.substring("builtin-".length());
+            BuiltinDefinition definition = definitionMap().get(siteKey);
+            if (definition == null) {
+                throw new NotFoundException("内置源不存在");
+            }
+            Map<String, BuiltinSubscriptionSourceState> settings = readBuiltinSettings();
+            BuiltinSubscriptionSourceState state = settings.computeIfAbsent(siteKey, ignored -> new BuiltinSubscriptionSourceState());
+            state.setName(StringUtils.trimToNull(update.name()));
+            state.setEnabled(update.enabled());
+            if (update.t4Visible() != null) {
+                state.setT4Visible(update.t4Visible());
+            }
+            state.setExtend(StringUtils.trimToNull(update.extend()));
+            if (state.getSortOrder() == null || state.getSortOrder() < 1) {
+                state.setSortOrder(definition.defaultSortOrder());
+            }
+            saveBuiltinSettings(settings);
+            return buildBuiltinSource(definition, state).source();
+        }
+
+        Integer pluginId = parsePluginId(id);
+        Plugin plugin = pluginRepository.findById(pluginId).orElseThrow(NotFoundException::new);
+        plugin.setName(StringUtils.defaultIfBlank(StringUtils.trimToNull(update.name()), plugin.getSourceName()));
+        plugin.setEnabled(update.enabled());
+        if (update.t4Visible() != null) {
+            plugin.setT4Visible(update.t4Visible());
+        }
+        // 详情增强三态:on/off/default;null=保持不变(仅改启用/T4 的调用方不受影响);内置源不走插件五动作,无此字段
+        if (update.detailEnhance() != null) {
+            plugin.setDetailEnhance(switch (update.detailEnhance()) {
+                case "on" -> Boolean.TRUE;
+                case "off" -> Boolean.FALSE;
+                default -> null;
+            });
+        }
+        plugin.setExtend(StringUtils.trimToEmpty(update.extend()));
+        pluginRepository.save(plugin);
+        return buildPluginSource(plugin).source();
+    }
+
+    public void reorder(List<String> ids) {
+        Map<String, BuiltinSubscriptionSourceState> settings = readBuiltinSettings();
+        List<Plugin> plugins = new ArrayList<>();
+        int order = 1;
+        for (String id : ids) {
+            if (id.startsWith("builtin-")) {
+                String siteKey = id.substring("builtin-".length());
+                BuiltinSubscriptionSourceState state = settings.computeIfAbsent(siteKey, ignored -> new BuiltinSubscriptionSourceState());
+                state.setSortOrder(order++);
+                if (state.getEnabled() == null) {
+                    state.setEnabled(true);
+                }
+            } else {
+                Plugin plugin = pluginRepository.findById(parsePluginId(id)).orElseThrow(NotFoundException::new);
+                plugin.setSortOrder(order++);
+                plugins.add(plugin);
+            }
+        }
+        if (!plugins.isEmpty()) {
+            pluginRepository.saveAll(plugins);
+        }
+        saveBuiltinSettings(settings);
+    }
+
+    /**
+     * 把插件行挪到插件区最前(第一个非内置源之前,全内置则追加尾部即内置之后):
+     * 新上传的自定义网页源不沉底;其余源保持相对顺序,订阅源管理中仍可任意调序。
+     */
+    /**
+     * 存量自定义网页源一次性前置:首版上传的网页源落在插件区之后(moveToFrontOfPlugins
+     * 仅对新建行生效,重扫保留既有位置),启动时一次性把它们挪到插件区最前;
+     * 迁移标志防重复,之后用户在订阅源管理里的手动调序不再被动。
+     */
+    public synchronized void migrateWebPagesToFrontOnce() {
+        if (settingRepository.existsByName(WEB_PAGES_FRONT_MIGRATED)) {
+            return;
+        }
+        List<ManagedSource> all = findAll();
+        List<String> webPageIds = new ArrayList<>();
+        for (ManagedSource source : all) {
+            if (!source.builtin() && source.url() != null
+                    && source.url().startsWith(PluginService.WEB_PAGE_URL_PREFIX)) {
+                webPageIds.add(source.id());
+            }
+        }
+        if (!webPageIds.isEmpty()) {
+            List<String> ordered = new ArrayList<>();
+            boolean inserted = false;
+            for (ManagedSource source : all) {
+                if (webPageIds.contains(source.id())) {
+                    continue;
+                }
+                if (!inserted && !source.builtin()) {
+                    ordered.addAll(webPageIds);
+                    inserted = true;
+                }
+                ordered.add(source.id());
+            }
+            if (!inserted) {
+                ordered.addAll(webPageIds);
+            }
+            reorder(ordered);
+        }
+        settingRepository.save(new Setting(WEB_PAGES_FRONT_MIGRATED, "true"));
+    }
+
+    public synchronized void moveToFrontOfPlugins(String pluginRowId) {
+        List<ManagedSource> all = findAll();
+        if (all.stream().noneMatch(source -> pluginRowId.equals(source.id()))) {
+            return;
+        }
+        List<String> ordered = new ArrayList<>();
+        boolean inserted = false;
+        for (ManagedSource source : all) {
+            if (!inserted && !source.builtin() && !pluginRowId.equals(source.id())) {
+                ordered.add(pluginRowId);
+                inserted = true;
+            }
+            if (!pluginRowId.equals(source.id())) {
+                ordered.add(source.id());
+            }
+        }
+        if (!inserted) {
+            ordered.add(pluginRowId);
+        }
+        reorder(ordered);
+    }
+
+    public void normalizeSortOrders() {
+        reorder(findAll().stream().map(ManagedSource::id).toList());
+    }
+
+    public int nextSortOrder() {
+        return findAll().stream()
+                .mapToInt(ManagedSource::sortOrder)
+                .max()
+                .orElse(0) + 1;
+    }
+
+    private List<ManagedSourceHolder> buildManagedSources() {
+        Map<String, BuiltinSubscriptionSourceState> settings = readBuiltinSettings();
+        List<ManagedSourceHolder> sources = new ArrayList<>();
+        for (BuiltinDefinition definition : builtinDefinitions()) {
+            sources.add(buildBuiltinSource(definition, settings.get(definition.siteKey())));
+        }
+        for (Plugin plugin : pluginRepository.findAllByOrderBySortOrderAscIdAsc()) {
+            sources.add(buildPluginSource(plugin));
+        }
+        sources.sort(Comparator.comparingInt((ManagedSourceHolder item) -> item.source().sortOrder())
+                .thenComparing(item -> item.source().id()));
+        return sources;
+    }
+
+    private ManagedSourceHolder buildBuiltinSource(BuiltinDefinition definition, BuiltinSubscriptionSourceState state) {
+        ManagedSource source = new ManagedSource(
+                "builtin-" + definition.siteKey(),
+                true,
+                null,
+                definition.siteKey(),
+                StringUtils.defaultIfBlank(state == null ? null : state.getName(), definition.defaultName()),
+                definition.defaultName(),
+                "",
+                state == null || state.getEnabled() == null || state.getEnabled(),
+                state == null || state.getT4Visible() == null || state.getT4Visible(),
+                null,
+                state == null || state.getSortOrder() == null || state.getSortOrder() < 1 ? definition.defaultSortOrder() : state.getSortOrder(),
+                null,
+                StringUtils.defaultString(state == null ? null : state.getExtend()),
+                "",
+                "",
+                false,
+                false,
+                EXTENDABLE_BUILTINS.contains(definition.siteKey())
+        );
+        return new ManagedSourceHolder(source, null);
+    }
+
+    public String getBuiltinExtend(String siteKey) {
+        if (!EXTENDABLE_BUILTINS.contains(siteKey)) {
+            return null;
+        }
+        BuiltinSubscriptionSourceState state = readBuiltinSettings().get(siteKey);
+        return state == null ? null : state.getExtend();
+    }
+
+    private ManagedSourceHolder buildPluginSource(Plugin plugin) {
+        // 自定义网页源:文件即内容,「刷新」按 spider 插件逻辑下载解析无意义,隐藏
+        boolean webPage = PluginService.isWebPagePlugin(plugin);
+        ManagedSource source = new ManagedSource(
+                "plugin-" + plugin.getId(),
+                false,
+                plugin.getId(),
+                plugin.getName(),
+                plugin.getName(),
+                plugin.getSourceName(),
+                plugin.getUrl(),
+                plugin.isEnabled(),
+                plugin.isT4Visible(),
+                plugin.getDetailEnhance(),
+                plugin.getSortOrder(),
+                plugin.getVersion(),
+                StringUtils.defaultString(plugin.getExtend()),
+                plugin.getLastCheckedAt() == null ? "" : plugin.getLastCheckedAt().toString(),
+                StringUtils.defaultString(plugin.getLastError()),
+                true,
+                !webPage,
+                !webPage
+        );
+        return new ManagedSourceHolder(source, plugin);
+    }
+
+    private Map<String, BuiltinDefinition> definitionMap() {
+        Map<String, BuiltinDefinition> map = new HashMap<>();
+        for (BuiltinDefinition definition : builtinDefinitions()) {
+            map.put(definition.siteKey(), definition);
+        }
+        return map;
+    }
+
+    private List<BuiltinDefinition> builtinDefinitions() {
+        List<BuiltinDefinition> definitions = new ArrayList<>();
+        int order = 1;
+        // WebHome 网页首页站(非 spider 站点,SubscriptionService.addSite 特判构建):
+        // 与其它内置源同权管理 —— 列表可见、可禁用、可调序;是否随订阅下发仍按客户端能力门禁
+        definitions.add(new BuiltinDefinition("atv_home", "影视首页", order++));
+        definitions.add(new BuiltinDefinition("csp_PianDan", "片单导航", order++));
+        Site xiaoya = siteRepository.findById(1).orElse(null);
+        if (xiaoya != null) {
+            definitions.add(new BuiltinDefinition("csp_XiaoYa", xiaoya.getName(), order++));
+        }
+        definitions.add(new BuiltinDefinition("csp_AList", "AList", order++));
+        definitions.add(new BuiltinDefinition("csp_Media", "我的追剧", order++));
+        definitions.add(new BuiltinDefinition("csp_BiliBili", "BiliBili", order++));
+        if (embyRepository.count() > 0) {
+            definitions.add(new BuiltinDefinition("csp_Emby", "Emby", order++));
+        }
+        if (jellyfinRepository.count() > 0) {
+            definitions.add(new BuiltinDefinition("csp_Jellyfin", "Jellyfin", order++));
+        }
+        if (feiniuRepository.count() > 0) {
+            definitions.add(new BuiltinDefinition("csp_FeiNiu", "飞牛影视", order++));
+        }
+        definitions.add(new BuiltinDefinition("csp_Live", "网络直播", order++));
+        definitions.add(new BuiltinDefinition("csp_TgDouBan", "电报豆瓣", order++));
+        if (StringUtils.isNotBlank(appProperties.getTgSearch())) {
+            definitions.add(new BuiltinDefinition("csp_TgChannel", "电报频道", order++));
+        }
+        definitions.add(new BuiltinDefinition("csp_TgWeb", "电报网页", order++));
+        if (StringUtils.isNotBlank(appProperties.getPanSouUrl())) {
+            definitions.add(new BuiltinDefinition("csp_FishPanSou", "鱼佬盘搜", order));
+            definitions.add(new BuiltinDefinition("csp_FishPanSouGroup", "盘搜 • 分组", order++));
+        }
+        definitions.add(new BuiltinDefinition("csp_Push", "AT推送", order++));
+        return definitions;
+    }
+
+    private Integer parsePluginId(String id) {
+        return Integer.parseInt(id.substring("plugin-".length()));
+    }
+
+    private Map<String, BuiltinSubscriptionSourceState> readBuiltinSettings() {
+        return settingRepository.findById(BUILTIN_SETTINGS_KEY)
+                .map(Setting::getValue)
+                .filter(StringUtils::isNotBlank)
+                .map(this::parseBuiltinSettings)
+                .orElseGet(HashMap::new);
+    }
+
+    private Map<String, BuiltinSubscriptionSourceState> parseBuiltinSettings(String value) {
+        try {
+            return objectMapper.readValue(value, new TypeReference<>() {
+            });
+        } catch (Exception e) {
+            return new HashMap<>();
+        }
+    }
+
+    private void saveBuiltinSettings(Map<String, BuiltinSubscriptionSourceState> settings) {
+        try {
+            settingRepository.save(new Setting(BUILTIN_SETTINGS_KEY, objectMapper.writeValueAsString(settings)));
+        } catch (Exception e) {
+            throw new IllegalStateException("保存内置源设置失败", e);
+        }
+    }
+}

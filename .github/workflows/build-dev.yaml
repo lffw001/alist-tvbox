@@ -24,12 +24,27 @@ on:
 
 jobs:
   release:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ inputs.branch }}
+
+      - name: Prepare release
+        uses: power721/atv-build-tools/prepare-release@v1
+        with:
+          token: ${{ secrets.RELEASE_MODULE_TOKEN }}
+
+      - name: Set telemetry endpoint
+        env:
+          TELEMETRY_URL: ${{ secrets.TELEMETRY_URL }}
+        run: |
+          if [ -n "$TELEMETRY_URL" ]; then
+            mkdir -p src/main/resources
+            printf 'app.telemetry.url=%s\n' "$TELEMETRY_URL" > src/main/resources/telemetry.properties
+          fi
+
       - name: show info
         run: |
           echo "git branch: ${{ inputs.branch }}"
@@ -38,7 +53,7 @@ jobs:
           echo "release: ${{ inputs.release }}"
           echo "HEAD_MESSAGE=$(git log -1 --pretty=%B)" >> $GITHUB_ENV
       - name: Setup node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: 22
           cache: npm
@@ -49,23 +64,29 @@ jobs:
       - name: Build web UI
         working-directory: ./web-ui
         run: npm run build
+        env:
+          VITE_TELEGRAM_INVITE_LINK: ${{ secrets.TELEGRAM_INVITE_LINK }}
       - name: Set up JDK
-        uses: actions/setup-java@v3
+        uses: actions/setup-java@v5
         with:
-          java-version: '17'
+          java-version: '21'
           distribution: 'corretto'
           cache: 'maven'
       - name: Build with Maven
         run: mvn -B package --file pom.xml
+
+      - name: Verify release artifact
+        uses: power721/atv-build-tools/verify-release@v1
+
       - name: Extract Spring Boot layers
         working-directory: ./target
         run: java -Djarmode=layertools -jar alist-tvbox-1.0.jar extract
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v2
+        uses: docker/setup-qemu-action@v4
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v2
+        uses: docker/setup-buildx-action@v4
       - name: Login to Docker Hub
-        uses: docker/login-action@v2
+        uses: docker/login-action@v4
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -78,7 +99,7 @@ jobs:
           cp data/version data/app_version
           cat data/version
       - name: Build docker and push
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: docker/Dockerfile-xiaoya
@@ -88,7 +109,7 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
       - name: Build host mode docker and push
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: docker/Dockerfile-host
@@ -98,7 +119,7 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
       - name: Build standalone docker and push
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: docker/Dockerfile

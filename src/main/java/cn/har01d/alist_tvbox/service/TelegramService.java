@@ -1,35 +1,35 @@
 package cn.har01d.alist_tvbox.service;
 
 import cn.har01d.alist_tvbox.config.AppProperties;
+import cn.har01d.alist_tvbox.domain.DriveId;
+import cn.har01d.alist_tvbox.domain.SearchTargets;
 import cn.har01d.alist_tvbox.dto.ShareLink;
 import cn.har01d.alist_tvbox.dto.tg.Message;
 import cn.har01d.alist_tvbox.dto.tg.SearchResponse;
 import cn.har01d.alist_tvbox.dto.tg.SearchResult;
 import cn.har01d.alist_tvbox.entity.Movie;
 import cn.har01d.alist_tvbox.entity.MovieRepository;
-import cn.har01d.alist_tvbox.entity.Setting;
 import cn.har01d.alist_tvbox.entity.SettingRepository;
 import cn.har01d.alist_tvbox.entity.TelegramChannel;
 import cn.har01d.alist_tvbox.entity.TelegramChannelRepository;
-import cn.har01d.alist_tvbox.exception.BadRequestException;
 import cn.har01d.alist_tvbox.model.Filter;
 import cn.har01d.alist_tvbox.model.FilterValue;
-import cn.har01d.alist_tvbox.tvbox.Category;
-import cn.har01d.alist_tvbox.tvbox.CategoryList;
+import cn.har01d.alist_tvbox.tvbox.Category;import cn.har01d.alist_tvbox.tvbox.CategoryList;
 import cn.har01d.alist_tvbox.tvbox.MovieDetail;
 import cn.har01d.alist_tvbox.tvbox.MovieList;
-import cn.har01d.alist_tvbox.util.IdUtils;
+import cn.har01d.alist_tvbox.util.TextUtils;
 import cn.har01d.alist_tvbox.util.Utils;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
-import com.fasterxml.jackson.databind.node.JsonNodeFactory;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.github.benmanes.caffeine.cache.Cache;
 import com.github.benmanes.caffeine.cache.Caffeine;
 import com.github.benmanes.caffeine.cache.LoadingCache;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
+import java.util.regex.Matcher;
 import lombok.extern.slf4j.Slf4j;
 import okhttp3.Call;
 import okhttp3.OkHttpClient;
@@ -40,7 +40,9 @@ import org.jsoup.Jsoup;
 import org.jsoup.nodes.Document;
 import org.jsoup.nodes.Element;
 import org.jsoup.select.Elements;
-import org.springframework.boot.web.client.RestTemplateBuilder;
+import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.restclient.RestTemplateBuilder;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.data.domain.Example;
 import org.springframework.data.domain.ExampleMatcher;
@@ -51,63 +53,34 @@ import org.springframework.data.domain.Sort;
 import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpMethod;
+import org.springframework.http.MediaType;
 import org.springframework.stereotype.Service;
+import org.springframework.web.client.HttpClientErrorException;
 import org.springframework.web.client.RestTemplate;
 import org.springframework.web.servlet.support.ServletUriComponentsBuilder;
-import reactor.core.publisher.Mono;
-import telegram4j.core.InitConnectionParams;
-import telegram4j.core.MTProtoTelegramClient;
-import telegram4j.core.auth.AuthorizationHandler;
-import telegram4j.core.auth.CodeAuthorizationHandler;
-import telegram4j.core.auth.QRAuthorizationHandler;
-import telegram4j.core.auth.TwoFactorHandler;
-import telegram4j.mtproto.store.FileStoreLayout;
-import telegram4j.mtproto.store.StoreLayout;
-import telegram4j.mtproto.store.StoreLayoutImpl;
-import telegram4j.tl.BaseChat;
-import telegram4j.tl.BaseMessage;
-import telegram4j.tl.Channel;
-import telegram4j.tl.ImmutableInputClientProxy;
-import telegram4j.tl.ImmutableInputPeerChannel;
-import telegram4j.tl.ImmutableInputPeerChat;
-import telegram4j.tl.InputClientProxy;
-import telegram4j.tl.InputMessagesFilterEmpty;
-import telegram4j.tl.InputPeer;
-import telegram4j.tl.InputPeerSelf;
-import telegram4j.tl.InputUserSelf;
-import telegram4j.tl.MessageEntityTextUrl;
-import telegram4j.tl.User;
-import telegram4j.tl.messages.ChannelMessages;
-import telegram4j.tl.messages.DialogsSlice;
-import telegram4j.tl.messages.ImmutableBaseDialogs;
-import telegram4j.tl.messages.Messages;
-import telegram4j.tl.request.messages.ImmutableGetDialogs;
-import telegram4j.tl.request.messages.ImmutableGetHistory;
-import telegram4j.tl.request.messages.ImmutableSearch;
 
 import java.io.IOException;
 import java.net.URI;
+import java.net.URLDecoder;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
-import java.nio.file.Path;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
-import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Base64;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.Iterator;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
-import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
-import java.util.TimeZone;
+import java.util.Set;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -132,13 +105,36 @@ public class TelegramService {
     private final RemoteSearchService remoteSearchService;
     private final RestTemplate restTemplate;
     private final ObjectMapper objectMapper;
+    private final ObjectProvider<PianDanService> pianDanServiceProvider;
     private final ExecutorService executorService = Executors.newFixedThreadPool(Math.min(10, Runtime.getRuntime().availableProcessors() * 2));
     private final OkHttpClient httpClient = new OkHttpClient();
-    private final LoadingCache<String, InputPeer> cache = Caffeine.newBuilder().build(this::resolveUsername);
     private final LoadingCache<String, List<Message>> searchCache = Caffeine.newBuilder().expireAfterWrite(Duration.ofMinutes(15)).build(this::getFromChannel);
+    /** 共享缓存对象契约:返回的 MovieList/MovieDetail 被多请求复用,消费方要么只读、要么先拷贝再改写
+     *  (MediaLibraryController/pianDan toNavigationList 均为拷贝式)—— 就地 set 会跨请求污染缓存。 */
     private final Cache<String, MovieList> douban = Caffeine.newBuilder().expireAfterWrite(Duration.ofHours(1)).build();
+
+    /** 分类类目 → recommend tags 基础词(2026-09 实测:类型/题材/地区/年代多词任意叠加,动画词自带剧集语义)。 */
+    private static final Map<String, String> DOUBAN_CATEGORY_BASE_TAGS = Map.of(
+            "tv_domestic", "电视剧",
+            "tv_american", "电视剧",
+            "tv_korean", "电视剧",
+            "tv_japanese", "电视剧",
+            "tv_animation", "动画",
+            "tv_variety_show", "综艺"
+    );
+    /** 类目默认地区:带筛选降级条件选片且用户未选地区时保留类目语义(欧美剧固定到美国,官方词表无「欧美」词)。 */
+    private static final Map<String, String> DOUBAN_CATEGORY_DEFAULT_REGIONS = Map.of(
+            "tv_domestic", "中国大陆",
+            "tv_american", "美国",
+            "tv_korean", "韩国",
+            "tv_japanese", "日本"
+    );
+    private static final Set<String> DOUBAN_RECOMMEND_SORTS = Set.of("T", "U", "R", "S");
+    /** recommend 服务端页大小恒 20(请求 limit 被忽略),start 步进与 pagecount 都按它算。 */
+    private static final int DOUBAN_RECOMMEND_PAGE_SIZE = 20;
     private final Cache<String, String> lastId = Caffeine.newBuilder().expireAfterWrite(Duration.ofHours(1)).build();
-    private MTProtoTelegramClient client;
+    private final Cache<String, MovieDetail> movies = Caffeine.newBuilder().maximumSize(200).expireAfterWrite(Duration.ofHours(2)).build();
+    private final Cache<String, String> videoName = Caffeine.newBuilder().maximumSize(200).expireAfterWrite(Duration.ofHours(2)).build();
     private final List<String> fields = new ArrayList<>(List.of("id", "name", "genre", "description", "language", "country", "directors", "editors", "actors", "cover", "dbScore", "year"));
     private final List<FilterValue> filters = Arrays.asList(
             new FilterValue("原始顺序", ""),
@@ -220,6 +216,21 @@ public class TelegramService {
                            RemoteSearchService remoteSearchService,
                            RestTemplateBuilder restTemplateBuilder,
                            ObjectMapper objectMapper) {
+        this(appProperties, telegramChannelRepository, settingRepository, movieRepository, shareService,
+                tvBoxService, remoteSearchService, restTemplateBuilder, objectMapper, null);
+    }
+
+    @Autowired
+    public TelegramService(AppProperties appProperties,
+                           TelegramChannelRepository telegramChannelRepository,
+                           SettingRepository settingRepository,
+                           MovieRepository movieRepository,
+                           ShareService shareService,
+                           TvBoxService tvBoxService,
+                           RemoteSearchService remoteSearchService,
+                           RestTemplateBuilder restTemplateBuilder,
+                           ObjectMapper objectMapper,
+                           ObjectProvider<PianDanService> pianDanServiceProvider) {
         this.appProperties = appProperties;
         this.telegramChannelRepository = telegramChannelRepository;
         this.settingRepository = settingRepository;
@@ -229,14 +240,12 @@ public class TelegramService {
         this.remoteSearchService = remoteSearchService;
         this.restTemplate = restTemplateBuilder.build();
         this.objectMapper = objectMapper;
+        // PianDanService 构造期依赖本类,直接注入成环:延迟解析(仅 db: 条目片名在线兜底用)
+        this.pianDanServiceProvider = pianDanServiceProvider;
     }
 
     @PostConstruct
     public void init() {
-        String tgPhase = settingRepository.findById("tg_phase").map(Setting::getValue).orElse("0");
-        if ("9".equals(tgPhase)) {
-            connect();
-        }
         if (telegramChannelRepository.count() == 0) {
             try {
                 var channels = loadChannels();
@@ -270,41 +279,18 @@ public class TelegramService {
         var channels = list();
         if (StringUtils.isNotBlank(appProperties.getTgSearch())) {
             try {
-                remoteValidate(channels);
+                getTgSearchHealth();
             } catch (Exception e) {
                 log.warn("validate channels error", e);
             }
         }
 
         for (var channel : channels) {
-            if (client != null && StringUtils.isBlank(appProperties.getTgSearch())) {
-                try {
-                    resolveUsername(channel.getUsername());
-                    channel.setValid(true);
-                } catch (Exception e) {
-                    log.warn("Access channel failed: {} {}", channel.getTitle(), e.getMessage());
-                    channel.setValid(false);
-                }
-            }
-
             validateWebAccess(channel);
         }
         telegramChannelRepository.saveAll(channels);
         log.info("validate channels success");
         return channels;
-    }
-
-    private void remoteValidate(List<TelegramChannel> channels) throws IOException {
-        String api = appProperties.getTgSearch() + "/validate";
-        api = api.replaceAll("//", "/");
-        String url = api + "?channels=" + channels.stream().map(TelegramChannel::getUsername).collect(Collectors.joining(","));
-        String json = getHtml(url);
-        if (StringUtils.isNotBlank(json)) {
-            Map<String, Boolean> results = objectMapper.readValue(json, Map.class);
-            for (var channel : channels) {
-                channel.setValid(results.get(channel.getUsername()));
-            }
-        }
     }
 
     private void validateWebAccess(TelegramChannel channel) {
@@ -323,7 +309,7 @@ public class TelegramService {
         var chat = getChannelByName(channel.getUsername());
         if (chat != null) {
             chat.setEnabled(channel.isEnabled());
-            chat.setOrder(channel.getOrder());
+            chat.setSortOrder(channel.getSortOrder());
             chat.setType(channel.getType());
             validateWebAccess(chat);
             telegramChannelRepository.save(chat);
@@ -332,229 +318,19 @@ public class TelegramService {
     }
 
     public List<TelegramChannel> list() {
-        return telegramChannelRepository.findAll(Sort.by("order"));
+        return telegramChannelRepository.findAll(Sort.by("sortOrder"));
     }
 
-    public void reset() {
-        settingRepository.deleteById("tg_phone");
-        settingRepository.deleteById("tg_code");
-        settingRepository.deleteById("tg_password");
-        settingRepository.deleteById("tg_qr_img");
-        settingRepository.deleteById("tg_scanned");
-        appProperties.setTgLogin(false);
-    }
-
-    public void logout() {
-        if (client != null) {
-            client.getServiceHolder().getAuthService().logOut().block();
-            client.disconnect().block();
-            client = null;
+    public ObjectNode getTgSearchHealth() {
+        if (StringUtils.isBlank(appProperties.getTgSearch())) {
+            ObjectNode result = objectMapper.createObjectNode();
+            result.put("service", "unconfigured");
+            result.put("message", "tg-search api url is blank");
+            return result;
         }
-
-        reset();
-        settingRepository.save(new Setting("tg_phase", "0"));
-
-        try {
-            Files.deleteIfExists(Utils.getDataPath("t4j.bin"));
-        } catch (IOException e) {
-            log.warn("删除session文件失败", e);
-        }
-    }
-
-    public void connect() {
-        appProperties.setTgLogin(false);
-        if (client != null) {
-            client.disconnect().block();
-        }
-
-        new Thread(() -> {
-            int apiId = IdUtils.getApiId();
-            String apiHash = IdUtils.getApiHash();
-            boolean qr = settingRepository.findById("tg_auth_type").map(Setting::getValue).orElse("qr").equals("qr");
-            AuthorizationHandler authHandler;
-            if (qr) {
-                log.info("Telegram扫码登陆");
-                settingRepository.deleteById("tg_scanned");
-                settingRepository.deleteById("tg_qr_img");
-                authHandler = new QRAuthorizationHandler(new QRAuthorizationHandler.Callback() {
-                    @Override
-                    public Mono<ActionType> onLoginToken(AuthorizationHandler.Resources res, QRAuthorizationHandler.Context ctx) {
-                        settingRepository.save(new Setting("tg_phase", "0"));
-                        log.info("Scan QR {}, expired: {}.", ctx.loginUrl(), ctx.expiresIn());
-                        try {
-                            String img = Utils.getQrCode(ctx.loginUrl());
-                            settingRepository.save(new Setting("tg_qr_img", img));
-                        } catch (IOException e) {
-                            return Mono.error(e);
-                        }
-                        settingRepository.save(new Setting("tg_phase", "1"));
-                        String scanned = waitSettingAvailable("tg_scanned");
-                        settingRepository.deleteById("tg_password");
-                        settingRepository.save(new Setting("tg_phase", "2"));
-                        return scanned != null ? Mono.just(ActionType.STOP) : Mono.just(ActionType.RETRY);
-                    }
-
-                    @Override
-                    public Mono<String> on2FAPassword(AuthorizationHandler.Resources res, TwoFactorHandler.Context ctx) {
-                        log.info("Input the 2FA password.");
-                        settingRepository.save(new Setting("tg_phase", "5"));
-                        String password = waitSettingAvailable("tg_password");
-                        settingRepository.save(new Setting("tg_phase", "6"));
-                        return password != null ? Mono.just(password) : Mono.empty();
-                    }
-                });
-            } else {
-                log.info("Telegram验证码登陆");
-                authHandler = new CodeAuthorizationHandler(new CodeAuthorizationHandler.Callback() {
-                    @Override
-                    public Mono<CodeAuthorizationHandler.PhoneNumberAction> onPhoneNumber(AuthorizationHandler.Resources res, CodeAuthorizationHandler.PhoneNumberContext ctx) {
-                        log.info("Input the phone number.");
-                        settingRepository.save(new Setting("tg_phase", "1"));
-                        String phone = waitSettingAvailable("tg_phone");
-                        settingRepository.deleteById("tg_code");
-                        settingRepository.deleteById("tg_password");
-                        settingRepository.save(new Setting("tg_phase", "2"));
-                        return phone != null ? Mono.just(CodeAuthorizationHandler.PhoneNumberAction.of(phone)) : Mono.just(CodeAuthorizationHandler.PhoneNumberAction.cancel());
-                    }
-
-                    @Override
-                    public Mono<CodeAuthorizationHandler.CodeAction> onSentCode(AuthorizationHandler.Resources res, CodeAuthorizationHandler.PhoneCodeContext ctx) {
-                        log.info("Input the verification code.");
-                        settingRepository.save(new Setting("tg_phase", "3"));
-                        String code = waitSettingAvailable("tg_code");
-                        settingRepository.save(new Setting("tg_phase", "4"));
-                        return code != null ? Mono.just(CodeAuthorizationHandler.CodeAction.of(code)) : Mono.just(CodeAuthorizationHandler.CodeAction.cancel());
-                    }
-
-                    @Override
-                    public Mono<String> on2FAPassword(AuthorizationHandler.Resources res, TwoFactorHandler.Context ctx) {
-                        log.info("Input the 2FA password.");
-                        settingRepository.save(new Setting("tg_phase", "5"));
-                        String password = waitSettingAvailable("tg_password");
-                        settingRepository.save(new Setting("tg_phase", "6"));
-                        return password != null ? Mono.just(password) : Mono.empty();
-                    }
-                });
-            }
-            StoreLayout storeLayout = new FileStoreLayout(new StoreLayoutImpl(c -> c.maximumSize(1000)), Utils.getDataPath("t4j.bin"));
-            client = MTProtoTelegramClient
-                    .create(apiId, apiHash, authHandler)
-                    .setStoreLayout(storeLayout)
-                    .setInitConnectionParams(initConnectionParams())
-                    .connect()
-                    .block();
-
-            if (client == null) {
-                settingRepository.save(new Setting("tg_phase", "0"));
-                log.warn("Telegram连接失败");
-                return;
-            }
-
-            settingRepository.save(new Setting("tg_phase", "9"));
-            appProperties.setTgLogin(true);
-            log.info("Telegram连接成功");
-            client.onDisconnect().block();
-            client = null;
-            log.info("Telegram关闭连接");
-        }).start();
-    }
-
-    private static InitConnectionParams initConnectionParams() {
-        InputClientProxy proxy = null;
-        Path path = Utils.getDataPath("proxy.txt");
-        if (Files.exists(path)) {
-            try {
-                String text = Files.readString(path).trim();
-                URI uri = new URI(text);
-                int port = uri.getPort();
-                if (port == -1) {
-                    port = getDefaultPort(uri.getScheme());
-                }
-                log.info("use proxy {}:{}", uri.getHost(), port);
-                proxy = ImmutableInputClientProxy.of(uri.getHost(), port);
-            } catch (Exception e) {
-                log.warn("Read proxy failed.", e);
-            }
-        }
-
-        String appVersion = "1.0.0";
-        String deviceModel = "AList-TvBox";
-        String systemVersion = String.join(" ", System.getProperty("os.name"),
-                System.getProperty("os.version"),
-                System.getProperty("os.arch"));
-
-        String langCode = Locale.getDefault().getLanguage().toLowerCase(Locale.ROOT);
-        JsonNode node = JsonNodeFactory.instance.objectNode()
-                .put("tz_offset", TimeZone.getDefault().getRawOffset() / 1000d);
-
-        log.debug("InitConnectionParams: {} {} {}", langCode, systemVersion, node);
-        return new InitConnectionParams(appVersion, deviceModel, langCode,
-                "", systemVersion, langCode, proxy, node);
-    }
-
-    private static int getDefaultPort(String scheme) {
-        if (scheme == null) return 8080;
-        return switch (scheme.toLowerCase()) {
-            case "http" -> 80;
-            case "https" -> 443;
-            case "socks", "socks5" -> 1080;
-            default -> 8080;
-        };
-    }
-
-    public User getUser() {
-        if (client == null) {
-            return null;
-        }
-        return client.getServiceHolder().getUserService().getUser(InputUserSelf.instance()).block();
-    }
-
-    public List<TelegramChannel> getAllChats() {
-        if (client == null) {
-            return List.of();
-        }
-        ImmutableBaseDialogs dialogs = (ImmutableBaseDialogs) client.getServiceHolder().getChatService().getDialogs(ImmutableGetDialogs.of(0, 0, 0, InputPeerSelf.instance(), 100, 0)).block();
-        return dialogs.chats().stream().map(this::parseChat).filter(Objects::nonNull).toList();
-    }
-
-    private TelegramChannel parseChat(telegram4j.tl.Chat chat) {
-        if (chat instanceof Channel) {
-            return new TelegramChannel((Channel) chat);
-        }
-        if (chat instanceof BaseChat) {
-            return new TelegramChannel((BaseChat) chat);
-        }
-        return null;
-    }
-
-    public List<Message> getHistory(String id) {
-        if (client == null) {
-            return List.of();
-        }
-        String[] parts = id.split("\\$");
-        InputPeer inputPeer = ImmutableInputPeerChannel.of(Long.parseLong(parts[0]), Long.parseLong(parts[1]));
-
-        Messages messages = client.getServiceHolder().getChatService().getHistory(ImmutableGetHistory.of(inputPeer, 0, 0, 0, 100, 0, 0, 0)).block();
-        log.info("{}", messages);
-        if (messages instanceof ChannelMessages) {
-            return ((ChannelMessages) messages).messages().stream().filter(e -> e instanceof BaseMessage).map(BaseMessage.class::cast).map(e -> new Message("", e)).toList();
-        }
-        return List.of();
-    }
-
-    private String waitSettingAvailable(String key) {
-        for (int i = 0; i < 120; ++i) {
-            String value = settingRepository.findById(key).map(Setting::getValue).orElse(null);
-            if (value != null) {
-                return value;
-            }
-            try {
-                Thread.sleep(1000);
-            } catch (InterruptedException e) {
-                break;
-            }
-        }
-        return null;
+        String api = normalizeTgSearchUrl("/api/health");
+        HttpEntity<Void> entity = new HttpEntity<>(null, buildTgSearchHeaders());
+        return restTemplate.exchange(api, HttpMethod.GET, entity, ObjectNode.class).getBody();
     }
 
     public Map<String, Object> searchZx(String keyword, String username) {
@@ -577,6 +353,8 @@ public class TelegramService {
                 total += list.size();
                 result.add(channel + "$$$" + list.stream().filter(e -> e.getContent().contains("http")).map(Message::toZxString).collect(Collectors.joining("##")));
             } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                log.warn("Search interrupted for channel: {}", channel);
                 break;
             } catch (ExecutionException | TimeoutException e) {
                 log.warn("", e);
@@ -627,12 +405,60 @@ public class TelegramService {
                 .collect(Collectors.joining("\n"));
     }
 
-    public MovieList detail(String tid) {
+    public MovieList detail(String tid, String ac, String title) {
+        return detail(tid, ac, title, null);
+    }
+
+    public MovieList detail(String tid, String ac, String title, String keyword) {
+        // 豆瓣条目卡片(db:/s:)不是分享链接:本源语义=按片名搜电报,与 listDouban 同口径;
+        // 爬虫 titleCache 会随 id 带上片名,优先用之省一次解析
+        if (tid.startsWith(PianDanService.DOUBAN_SUBJECT_PREFIX) || tid.startsWith("s:")) {
+            String name = title;
+            if (StringUtils.isBlank(name)) {
+                name = tid.startsWith("s:") ? PianDanService.parseSubjectId(tid).name() : resolveDoubanSubjectTitle(tid);
+            }
+            if (StringUtils.isBlank(name)) {
+                return new MovieList();
+            }
+            return searchMovies(name, false, 20);
+        }
+        if (tid.startsWith("%2Fv%2F")) {
+            tid = StringUtils.trimToEmpty(URLDecoder.decode(tid, StandardCharsets.UTF_8));
+        }
+        if (tid.startsWith("/v/")) {
+            MovieList list = new MovieList();
+            MovieDetail detail = new MovieDetail();
+            detail.setVod_id(getVid(tid));
+            detail.setVod_name("视频");
+            String name = videoName.getIfPresent(getVid(tid));
+            if (name != null) {
+                detail.setVod_name(name);
+            }
+            detail.setVod_play_from("电报");
+            detail.setVod_play_url(resolveTgSearchMediaUrl(tid));
+            list.getList().add(detail);
+            log.debug("{}", list);
+            return list;
+        }
+
         ShareLink share = new ShareLink();
         share.setLink(tid);
         String path = shareService.add(share);
 
-        return tvBoxService.getDetail("", "1$" + path + "/~playlist");
+        if (StringUtils.isBlank(title)) {
+            MovieDetail movie = movies.getIfPresent(tid);
+            if (movie != null) {
+                title = movie.getVod_name();
+            }
+        }
+        // 持久层兜底(RemoteSearchService.detail/ParseService.drive 同款):参数/内存缓存命中即回写
+        // Share.title 落库——titleCache/movies 随重启清空后,壳子历史/收藏直达详情仍可恢复剧名,
+        // 不会再退化用防审核拆字目录名(如「S【上@供|住】」)匹配豆瓣
+        title = shareService.resolveShareTitle(tid, title);
+
+        MovieList movieList = tvBoxService.getDetail(ac, "1$" + path + "/~playlist", title, keyword, 0);
+        log.debug("{}", movieList);
+        return movieList;
     }
 
     private String encodeUrl(String url) {
@@ -652,8 +478,8 @@ public class TelegramService {
         }
 
         List<TelegramChannel> channels;
-        if (web || (client == null && StringUtils.isBlank(appProperties.getTgSearch()))) {
-            channels = telegramChannelRepository.findByWebAccessTrue(Sort.by("order"));
+        if (web || (StringUtils.isBlank(appProperties.getTgSearch()))) {
+            channels = telegramChannelRepository.findByWebAccessTrue(Sort.by("sortOrder"));
         } else {
             channels = list();
         }
@@ -696,16 +522,7 @@ public class TelegramService {
 
         for (Message message : messages) {
             if (appProperties.getTgDrivers().isEmpty() || appProperties.getTgDrivers().contains(message.getType())) {
-                MovieDetail movieDetail = new MovieDetail();
-                movieDetail.setVod_id(encodeUrl(message.getLink()));
-                movieDetail.setVod_name(message.getName());
-                if (StringUtils.isBlank(message.getCover())) {
-                    movieDetail.setVod_pic(getPic(message.getType()));
-                } else {
-                    movieDetail.setVod_pic(message.getCover());
-                }
-                movieDetail.setVod_remarks(getTypeName(message.getType()));
-                list.add(movieDetail);
+                list.add(toMovieDetail(message));
             }
         }
 
@@ -729,18 +546,11 @@ public class TelegramService {
         List<Message> messages = search("", 100, web, true);
         for (Message message : messages) {
             if (type.equals(message.getType())) {
-                MovieDetail movieDetail = new MovieDetail();
-                movieDetail.setVod_id(encodeUrl(message.getLink()));
-                movieDetail.setVod_name(message.getName());
-                if (StringUtils.isBlank(message.getCover())) {
-                    movieDetail.setVod_pic(getPic(message.getType()));
-                } else {
-                    movieDetail.setVod_pic(message.getCover());
-                }
-                movieDetail.setVod_remarks(getTypeName(message.getType()));
-                list.add(movieDetail);
+                list.add(toMovieDetail(message));
             }
         }
+
+        log.debug("Search results: {}", list.subList(0, Math.min(list.size(), 30)));
 
         result.setList(list);
         result.setTotal(list.size());
@@ -755,23 +565,79 @@ public class TelegramService {
 
         List<Message> messages = search(keyword, size, web, false);
         for (Message message : messages) {
-            MovieDetail movieDetail = new MovieDetail();
-            movieDetail.setVod_id(encodeUrl(message.getLink()));
-            movieDetail.setVod_name(message.getName());
-            if (StringUtils.isBlank(message.getCover())) {
-                movieDetail.setVod_pic(getPic(message.getType()));
-            } else {
-                movieDetail.setVod_pic(message.getCover());
-            }
-            movieDetail.setVod_remarks(getTypeName(message.getType()));
-            list.add(movieDetail);
+            list.add(toMovieDetail(message));
         }
+
+        log.debug("Search results: {} {}", keyword, list.subList(0, Math.min(list.size(), 30)));
 
         result.setList(list);
         result.setTotal(list.size());
         result.setLimit(list.size());
 
         return result;
+    }
+
+    public CategoryList categoryTgSearch() {
+        CategoryList result = new CategoryList();
+        List<Category> list = new ArrayList<>();
+
+        for (String type : appProperties.getTgDrivers()) {
+            var category = new Category();
+            category.setType_id("type:" + type);
+            category.setType_name(getTypeName(type));
+            category.setType_flag(0);
+            list.add(category);
+        }
+
+        result.setCategories(list);
+        result.setTotal(list.size());
+        result.setLimit(list.size());
+        return result;
+    }
+
+    public MovieList listTgSearch(String type, int page, int size) {
+        String keyword = "";
+        String filterType = StringUtils.isNotBlank(type) && type.startsWith("type:") ? type.substring(5) : type;
+        TgSearchResult searchResult = searchTgSearchApi(keyword, getCloudType(filterType), page, size);
+        List<Message> messages = searchResult.messages();
+        if (StringUtils.isNotBlank(filterType)) {
+            messages = messages.stream().filter(message -> filterType.equals(message.getType())).toList();
+        }
+        return toMovieList(new TgSearchResult(messages, searchResult.total()), page, size);
+    }
+
+    public MovieList searchTgSearchMovies(String keyword, int page, int size) {
+        return toMovieList(searchTgSearchApi(keyword, null, page, size), page, size);
+    }
+
+    private MovieList toMovieList(TgSearchResult searchResult, int page, int size) {
+        int safePage = Math.max(1, page);
+        int safeSize = Math.max(1, size);
+        MovieList result = new MovieList();
+        List<MovieDetail> list = new ArrayList<>();
+        List<String> tgDrivers = appProperties.getTgDrivers();
+        for (Message message : remoteSearchService.filterInvalidPanSouLinks(searchResult.messages())) {
+            if (tgDrivers.isEmpty() || tgDrivers.contains(message.getType())) {
+                list.add(toMovieDetail(message));
+            }
+        }
+        result.setList(list);
+        result.setPage(safePage);
+        result.setTotal(searchResult.total());
+        result.setLimit(safeSize);
+        result.setPagecount(Math.max(1, (searchResult.total() + safeSize - 1) / safeSize));
+        if (log.isDebugEnabled()) {
+            log.debug("list result: {}", Utils.toJsonString(result));
+        }
+        return result;
+    }
+
+    private String getVid(String link) {
+        int index = link.indexOf("?");
+        if (index != -1) {
+            return link.substring(0, index);
+        }
+        return link;
     }
 
     public CategoryList categoryDouban() {
@@ -953,50 +819,96 @@ public class TelegramService {
         return result;
     }
 
-    public MovieList listDouban(String type, String sort, Integer year, String genre, String region, int page) {
+    /** year 接受单年("2024")与年代段词("2020年代"):前者 local 本地库查询转数字,后者只对 recommend 条件选片有意义。 */
+    public MovieList listDouban(String type, String ac, String sort, String year, String genre, String region, int page, int size) {
         if (type.startsWith("s:")) {
-            return searchMovies(type.substring(2), false, 30);
+            // s: 条目 id 带 @{年} 内嵌后缀,搜索只认裸标题
+            return searchMovies(PianDanService.parseSubjectId(type).name(), false, size);
         }
 
-        return getDoubanList(type, sort, year, genre, region, page);
+        if (type.startsWith(PianDanService.DOUBAN_SUBJECT_PREFIX)) {
+            // db:{id} 条目被 TVBox 前端当分类 t 发来(点击豆瓣卡片加载详情):与 s: 同语义,按片名搜电报
+            String name = resolveDoubanSubjectTitle(type);
+            if (StringUtils.isBlank(name)) {
+                return new MovieList();
+            }
+            return searchMovies(name, false, size);
+        }
+
+        return getDoubanList(type, ac, sort, year, genre, region, page, size);
     }
 
-    private MovieList getDoubanList(String type, String sort, Integer year, String genre, String region, int page) {
-        String key = type + "-" + page;
+    private MovieList getDoubanList(String type, String ac, String sort, String year, String genre, String region, int page, int size) {
+        // key 含 size:用户可控 size(默认 30)不同值同 key 会互相污染,命中缓存返回错乱页大小
+        String key = ac + "-" + type + "-" + page + "-" + size + "-" + StringUtils.defaultString(sort) + "-" + year
+                + "-" + StringUtils.defaultString(genre) + "-" + StringUtils.defaultString(region);
         MovieList result = douban.getIfPresent(key);
         if (result != null) {
             return result;
         }
 
         if (type.equals("local")) {
-            return getLocalMovieList(sort, year, genre, region, page);
+            return getLocalMovieList(ac, sort, toYear(year), genre, region, page, size);
         }
 
         if (type.equals("random")) {
-            return getRandomMovie();
+            return getRandomMovie(ac, size);
+        }
+
+        if (type.equals("suggestion")) {
+            // TVBox 首页推荐位固定发 t=0(控制器映射为裸 suggestion):电影+剧集推荐交错混合
+            return getSuggestionList(ac, page, size, key);
         }
 
         if (type.startsWith("suggestion_")) {
-            return getDoubanItems(type, page);
+            return getDoubanItems(type, ac, page, size, key);
         }
 
         if (type.startsWith("hot_")) {
-            return getDoubanItems(type, page);
+            if (hasDoubanFilters(sort, year, genre, region)) {
+                boolean tv = type.equals("hot_tv");
+                return getRecommendList(tv ? "tv" : "movie",
+                        buildRecommendTags(tv ? "电视剧" : "电影", region, genre, year), sort, page, ac, key);
+            }
+            return getDoubanItems(type, ac, page, size, key);
+        }
+
+        // 分类类目带筛选降级条件选片(同 TMDB upgradeFixedListFilters 手法):不带筛选维持原站固定列表。
+        // 地区未选时回落类目默认地区(国产剧/韩剧等类目语义在 tags 里靠它保留),显式选择则覆盖。
+        String baseTags = DOUBAN_CATEGORY_BASE_TAGS.get(type);
+        if (baseTags != null && hasDoubanFilters(sort, year, genre, region)) {
+            String defaultRegion = DOUBAN_CATEGORY_DEFAULT_REGIONS.getOrDefault(type, "");
+            return getRecommendList("tv",
+                    buildRecommendTags(baseTags, StringUtils.defaultIfBlank(region, defaultRegion), genre, year),
+                    sort, page, ac, key);
         }
 
         result = new MovieList();
         List<MovieDetail> list = new ArrayList<>();
 
-        int size = 30;
         int start = (page - 1) * size;
         String url = "https://m.douban.com/rexxar/api/v2/subject_collection/" + type + "/items?os=linux&for_mobile=1&callback=&start=" + start + "&count=" + size + "&loc_id=108288&_=0";
         HttpEntity<Void> httpEntity = buildHttpEntity();
 
-        var response = restTemplate.exchange(url, HttpMethod.GET, httpEntity, JsonNode.class);
-        int total = response.getBody().get("total").asInt();
-        ArrayNode items = (ArrayNode) response.getBody().get("subject_collection_items");
+        JsonNode body;
+        try {
+            var response = restTemplate.exchange(url, HttpMethod.GET, httpEntity, JsonNode.class);
+            body = response.getBody();
+        } catch (HttpClientErrorException.NotFound e) {
+            // 未知分类(榜单下线/前端误传条目 id):空列表收场,不给客户端炸 500
+            log.warn("douban subject_collection not found: {}", type);
+            result = new MovieList();
+            douban.put(key, result);
+            return result;
+        }
+        int total = body.get("total").asInt();
+        ArrayNode items = (ArrayNode) body.get("subject_collection_items");
         for (JsonNode item : items) {
             MovieDetail movieDetail = getMovieDetail(item);
+            if ("web".equals(ac)) {
+                fixCover(movieDetail);
+                movieDetail.setCate(null);
+            }
             list.add(movieDetail);
         }
 
@@ -1010,12 +922,20 @@ public class TelegramService {
         return result;
     }
 
-    private MovieList getLocalMovieList(String sort, Integer year, String genre, String region, int page) {
+    private void fixCover(MovieDetail movie) {
+        if (StringUtils.isEmpty(movie.getVod_pic())) {
+            return;
+        }
+        // 相对地址交给浏览器按页面源补全:fromCurrentRequest 在 https 反代未开 enable_https 时会拼出
+        // http:// 封面被按混合内容拦截(TMDB 直链不受影响),换域名/端口也不会再拼错
+        movie.setVod_pic("/images?url=" + movie.getVod_pic());
+    }
+
+    private MovieList getLocalMovieList(String ac, String sort, Integer year, String genre, String region, int page, int size) {
         MovieList result;
         result = new MovieList();
         List<MovieDetail> list = new ArrayList<>();
 
-        int size = 30;
         Pageable pageable;
         if (StringUtils.isNotBlank(sort)) {
             List<Sort.Order> orders = new ArrayList<>();
@@ -1034,12 +954,19 @@ public class TelegramService {
 
         for (Movie movie : res) {
             MovieDetail movieDetail = new MovieDetail();
-            movieDetail.setVod_id("s:" + movie.getName());
+            movieDetail.setVod_id(PianDanService.doubanSubjectId(movie.getId()));
             movieDetail.setVod_name(movie.getName());
             movieDetail.setVod_pic(movie.getCover());
             movieDetail.setVod_remarks(movie.getDbScore());
+            if (movie.getYear() != null) {
+                movieDetail.setVod_year(String.valueOf(movie.getYear()));
+            }
             movieDetail.setVod_tag(FOLDER);
-            movieDetail.setCate(new CategoryList());
+            if ("web".equals(ac)) {
+                fixCover(movieDetail);
+            } else {
+                movieDetail.setCate(new CategoryList());
+            }
             list.add(movieDetail);
         }
 
@@ -1071,14 +998,14 @@ public class TelegramService {
         return movieRepository.findAll(example, pageable);
     }
 
-    private MovieList getRandomMovie() {
+    private MovieList getRandomMovie(String ac, int size) {
         MovieList result = new MovieList();
         List<MovieDetail> list = new ArrayList<>();
 
         int total = (int) movieRepository.count();
-        int size = 30;
         int count = size + size / 2;
-        int page = ThreadLocalRandom.current().nextInt(total / count);
+        // 空库(total=0)或 total<count 时 nextInt(0) 抛 IllegalArgumentException → 固定第 0 页
+        int page = total > count ? ThreadLocalRandom.current().nextInt(total / count) : 0;
         Collections.shuffle(fields);
         List<Sort.Order> orders = fields.stream().limit(3).map(e -> ThreadLocalRandom.current().nextBoolean() ? Sort.Order.asc(e) : Sort.Order.desc(e)).toList();
         Sort sort = Sort.by(orders);
@@ -1090,12 +1017,19 @@ public class TelegramService {
 
         for (Movie movie : movies.subList(0, size)) {
             MovieDetail movieDetail = new MovieDetail();
-            movieDetail.setVod_id("s:" + movie.getName());
+            movieDetail.setVod_id(PianDanService.doubanSubjectId(movie.getId()));
             movieDetail.setVod_name(movie.getName());
             movieDetail.setVod_pic(movie.getCover());
             movieDetail.setVod_remarks(movie.getDbScore());
+            if (movie.getYear() != null) {
+                movieDetail.setVod_year(String.valueOf(movie.getYear()));
+            }
             movieDetail.setVod_tag(FOLDER);
-            movieDetail.setCate(new CategoryList());
+            if ("web".equals(ac)) {
+                fixCover(movieDetail);
+            } else {
+                movieDetail.setCate(new CategoryList());
+            }
             list.add(movieDetail);
         }
 
@@ -1108,9 +1042,7 @@ public class TelegramService {
         return result;
     }
 
-    private MovieList getDoubanItems(String type, int page) {
-        String key = type + "-" + page;
-        int size = 30;
+    private MovieList getDoubanItems(String type, String ac, int page, int size, String cacheKey) {
         int start = (page - 1) * size;
         String url = "https://m.douban.com/rexxar/api/v2/subject/recent_hot/movie?limit=" + size + "&start=" + start;
         if (type.equals("hot_tv")) {
@@ -1126,11 +1058,15 @@ public class TelegramService {
 
         HttpEntity<Void> httpEntity = buildHttpEntity();
 
-        var response = restTemplate.exchange(url, HttpMethod.GET, httpEntity, JsonNode.class);
+        var response = restTemplate.exchange(URI.create(url), HttpMethod.GET, httpEntity, JsonNode.class);
         int total = response.getBody().get("total").asInt();
         ArrayNode items = (ArrayNode) response.getBody().get("items");
         for (JsonNode item : items) {
             MovieDetail movieDetail = getMovieDetail(item);
+            if ("web".equals(ac)) {
+                fixCover(movieDetail);
+                movieDetail.setCate(null);
+            }
             list.add(movieDetail);
         }
 
@@ -1139,9 +1075,130 @@ public class TelegramService {
         result.setTotal(total);
         result.setPagecount((total + size - 1) / size);
 
-        douban.put(key, result);
+        douban.put(cacheKey, result);
         log.debug("list result: {}", result);
         return result;
+    }
+
+    /** 裸 suggestion(TVBox 首页推荐位):电影/剧集推荐两池交错混合,池子容量小(实测 total 各 ~60)不翻深页。 */
+    private MovieList getSuggestionList(String ac, int page, int size, String cacheKey) {
+        int half = Math.max(1, size / 2);
+        MovieList movies = getDoubanItems("suggestion_movie", ac, page, half, cacheKey + ":movie");
+        MovieList tvs = getDoubanItems("suggestion_tv", ac, page, Math.max(1, size - half), cacheKey + ":tv");
+
+        List<MovieDetail> mixed = new ArrayList<>();
+        int max = Math.max(movies.getList().size(), tvs.getList().size());
+        for (int i = 0; i < max && mixed.size() < size; i++) {
+            if (i < movies.getList().size()) {
+                mixed.add(movies.getList().get(i));
+            }
+            if (mixed.size() < size && i < tvs.getList().size()) {
+                mixed.add(tvs.getList().get(i));
+            }
+        }
+
+        MovieList result = new MovieList();
+        result.setList(mixed);
+        result.setLimit(mixed.size());
+        result.setTotal(movies.getTotal() + tvs.getTotal());
+        result.setPagecount(Math.max(1, (movies.getTotal() + tvs.getTotal() + size - 1) / size));
+        douban.put(cacheKey, result);
+        log.debug("list result: {}", result);
+        return result;
+    }
+
+    /** db:{豆瓣id} → 片名:本地豆瓣库 id 直取(Movie.id 即豆瓣 subject id),未收录的榜单新片回落
+     *  rexxar 在线解析(PianDanService.doubanSubjectDetail,tv 404 再试 movie,自带短缓存)。 */
+    private String resolveDoubanSubjectTitle(String id) {
+        String digits = id.substring(PianDanService.DOUBAN_SUBJECT_PREFIX.length());
+        if (!digits.matches("\\d+")) {
+            return null;
+        }
+        int doubanId = Integer.parseInt(digits);
+        return movieRepository.findById(doubanId)
+                .map(Movie::getName)
+                .orElseGet(() -> {
+                    if (pianDanServiceProvider == null) {
+                        return null;
+                    }
+                    MovieDetail detail = pianDanServiceProvider.getObject().doubanSubjectDetail(doubanId);
+                    return detail == null ? null : detail.getVod_name();
+                });
+    }
+
+    /**
+     * 豆瓣条件选片(recommend?tags= 语法,2026-09 实测):类型/题材/地区/年代多词任意叠加,
+     * 排序四态 T综合/U近期热度/R首播时间/S高分优先,无效词显式返回 total=0。
+     * 服务端页大小恒 20(请求 limit 被忽略):start 步进与 pagecount 都按 20 算,
+     * 防上层按 size=24 步进导致每页漏条(web/TVBox 共用 pianDanList 固定 size=24)。
+     */
+    private MovieList getRecommendList(String kind, String tags, String sort, int page, String ac, String cacheKey) {
+        String sortValue = sort != null && DOUBAN_RECOMMEND_SORTS.contains(sort) ? sort : "U";
+        int start = (page - 1) * DOUBAN_RECOMMEND_PAGE_SIZE;
+        String encoded = URLEncoder.encode(tags, StandardCharsets.UTF_8);
+        String url = "https://m.douban.com/rexxar/api/v2/" + kind + "/recommend?refresh=0&start=" + start
+                + "&limit=" + DOUBAN_RECOMMEND_PAGE_SIZE + "&uncollect=false&sort=" + sortValue + "&tags=" + encoded;
+
+        MovieList result = new MovieList();
+        List<MovieDetail> list = new ArrayList<>();
+
+        HttpEntity<Void> httpEntity = buildHttpEntity();
+
+        // tags 已 URLEncoder 预编码:传 String 会经 uriTemplateHandler 二次编码(%→%25)使 tags 变乱码,
+        // 豆瓣按乱码 tag 匹配 total=0(地区筛选全空);传 URI 跳过模板编码
+        var response = restTemplate.exchange(URI.create(url), HttpMethod.GET, httpEntity, JsonNode.class);
+        int total = response.getBody().get("total").asInt();
+        ArrayNode items = (ArrayNode) response.getBody().get("items");
+        for (JsonNode item : items) {
+            MovieDetail movieDetail = getMovieDetail(item);
+            if ("web".equals(ac)) {
+                fixCover(movieDetail);
+                movieDetail.setCate(null);
+            }
+            list.add(movieDetail);
+        }
+
+        result.setList(list);
+        result.setLimit(list.size());
+        result.setTotal(total);
+        result.setPagecount((total + DOUBAN_RECOMMEND_PAGE_SIZE - 1) / DOUBAN_RECOMMEND_PAGE_SIZE);
+
+        douban.put(cacheKey, result);
+        log.debug("list result: {}", result);
+        return result;
+    }
+
+    private static boolean hasDoubanFilters(String sort, String year, String genre, String region) {
+        return StringUtils.isNotBlank(sort) || StringUtils.isNotBlank(year) || StringUtils.isNotBlank(genre) || StringUtils.isNotBlank(region);
+    }
+
+    /** tags 词序固定为 类型,地区,题材,年代(服务端对词序不敏感,固定序保证缓存 key 稳定),重复词去重。 */
+    private static String buildRecommendTags(String baseTags, String region, String genre, String year) {
+        LinkedHashSet<String> parts = new LinkedHashSet<>();
+        for (String word : baseTags.split(",")) {
+            if (StringUtils.isNotBlank(word)) {
+                parts.add(word);
+            }
+        }
+        if (StringUtils.isNotBlank(region)) {
+            parts.add(region);
+        }
+        if (StringUtils.isNotBlank(genre)) {
+            parts.add(genre);
+        }
+        if (StringUtils.isNotBlank(year)) {
+            parts.add(year);
+        }
+        return String.join(",", parts);
+    }
+
+    /** local 本地库的年份等值查询只认数字,年代段词等非数字回落不筛选。 */
+    private static Integer toYear(String year) {
+        try {
+            return StringUtils.isBlank(year) ? null : Integer.valueOf(year);
+        } catch (NumberFormatException e) {
+            return null;
+        }
     }
 
     private static HttpEntity<Void> buildHttpEntity() {
@@ -1154,17 +1211,37 @@ public class TelegramService {
     }
 
     private static MovieDetail getMovieDetail(JsonNode item) {
-        double score = item.get("rating").get("value").asDouble();
+        double score = item.path("rating").path("value").asDouble(0);
         MovieDetail movieDetail = new MovieDetail();
-        movieDetail.setVod_id("s:" + item.get("title").asText());
-        movieDetail.setVod_name(item.get("title").asText());
-        movieDetail.setVod_pic(item.get("pic").get("normal").asText());
+        String title = item.get("title").asText();
+        Integer year = parseYear(item.path("year").asText(item.path("card_subtitle").asText("")));
+        // rexxar 条目自带豆瓣 subject id:独立 db:{id} 类型(纯数字不嵌标题,爬虫裸拼 GET 不怕 &/# 截断),
+        // 无 id 的条目才回落内嵌标题的 s: 形态
+        String idText = item.path("id").asText("");
+        if (idText.matches("\\d+")) {
+            movieDetail.setVod_id(PianDanService.doubanSubjectId(Integer.parseInt(idText)));
+        } else {
+            movieDetail.setVod_id(PianDanService.subjectId(title, year));
+        }
+        movieDetail.setVod_name(title);
+        movieDetail.setVod_pic(item.path("pic").path("normal").asText(""));
         if (score > 0) {
             movieDetail.setVod_remarks(String.valueOf(score));
+        }
+        if (year != null) {
+            movieDetail.setVod_year(String.valueOf(year));
         }
         movieDetail.setVod_tag(FOLDER);
         movieDetail.setCate(new CategoryList());
         return movieDetail;
+    }
+
+    /** 年份字段可能是纯 "2023" 或 card_subtitle 形如 "2023 · 中国大陆 · ..." 的前缀,取不到返 null。 */
+    private static Integer parseYear(String text) {
+        if (StringUtils.isBlank(text)) {
+            return null;
+        }
+        Matcher matcher = java.util.regex.Pattern.compile("(\\d{4})").matcher(text);        return matcher.find() ? Integer.valueOf(matcher.group(1)) : null;
     }
 
     public MovieList searchDouban(String keyword, int size) {
@@ -1187,6 +1264,10 @@ public class TelegramService {
             case "8" -> "115";
             case "9" -> "天翼";
             case "10" -> "百度";
+            case "12" -> "光鸭";
+            case "magnet" -> "磁力";
+            case "ed2k" -> "ED2K";
+            case "video" -> "视频";
             default -> null;
         };
     }
@@ -1206,40 +1287,126 @@ public class TelegramService {
             case "9" -> getUrl("/189.png");
             case "6" -> getUrl("/139.jpg");
             case "10" -> getUrl("/baidu.jpg");
+            case "12" -> getUrl("/guangya.webp");
+            case "magnet" -> getUrl("/magnet.png");
+            case "ed2k" -> getUrl("/ed2k.jpg");
             default -> null;
         };
     }
 
     private String getUrl(String path) {
         return ServletUriComponentsBuilder.fromCurrentRequest()
-                .scheme(appProperties.isEnableHttps() && !Utils.isLocalAddress() ? "https" : "http") // nginx https
+                .scheme(Utils.publicScheme(appProperties.isEnableHttps())) // nginx https
                 .replacePath(path)
                 .replaceQuery(null)
                 .build()
                 .toUriString();
     }
 
+    private MovieDetail toMovieDetail(Message message) {
+        MovieDetail movieDetail = new MovieDetail();
+        movieDetail.setVod_id(encodeUrl(message.getLink()));
+        movieDetail.setVod_name(StringUtils.defaultIfBlank(message.getName(), message.getContent()));
+        if (StringUtils.isBlank(message.getCover())) {
+            movieDetail.setVod_pic(getPic(message.getType()));
+        } else {
+            movieDetail.setVod_pic(resolveTgSearchMediaUrl(message.getCover()));
+        }
+        movieDetail.setVod_remarks(getTypeName(message.getType()));
+        movieDetail.setVod_play_from(message.getChannel());
+        if (message.getTime() != null) {
+            movieDetail.setVod_time(message.getTime().toString());
+        }
+        applyMedia(message, movieDetail);
+        if ("video".equals(message.getType())) {
+            videoName.put(getVid(message.getLink()), movieDetail.getVod_name());
+            if (message.getSize() != null) {
+                movieDetail.setVod_remarks(Utils.byte2size(message.getSize()));
+            }
+        }
+        // cache every search result (not only media-bearing ones, which applyMedia
+        // handles) so detail() can backfill vod_name when the resolved storage
+        // folder name is an obfuscated share token instead of the real title.
+        if (StringUtils.isNotBlank(message.getLink())) {
+            movies.put(message.getLink(), movieDetail);
+        }
+        return movieDetail;
+    }
+
+    private void applyMedia(Message message, MovieDetail movieDetail) {
+        Map<String, Object> media = message.getMedia();
+        if (media == null || media.isEmpty()) {
+            return;
+        }
+        Object title = media.get("title");
+        if (title != null && StringUtils.isNotBlank(String.valueOf(title))) {
+            movieDetail.setVod_name(TextUtils.fixName(TextUtils.stripLeadingNoise(String.valueOf(title))));
+        }
+        Object year = media.get("year");
+        if (year != null && StringUtils.isNotBlank(String.valueOf(year))) {
+            movieDetail.setVod_year(String.valueOf(year));
+        }
+        List<String> remarks = Stream.of(movieDetail.getVod_remarks(), media.get("episode"), media.get("quality"), media.get("size"))
+                .filter(e -> e != null && StringUtils.isNotBlank(String.valueOf(e)))
+                .map(String::valueOf)
+                .toList();
+        if (!remarks.isEmpty()) {
+            movieDetail.setVod_remarks(String.join(" ", remarks));
+        }
+        List<String> content = Stream.of(message.getContent(), media.get("tags"))
+                .filter(e -> e != null && StringUtils.isNotBlank(String.valueOf(e)))
+                .map(String::valueOf)
+                .toList();
+        if (!content.isEmpty()) {
+            movieDetail.setVod_content(String.join("\n", content));
+        }
+//        movieDetail.setExt(media);
+        log.debug("cache put: {} {}", message.getLink(), media);
+        movies.put(message.getLink(), movieDetail);
+    }
+
+    private String resolveTgSearchMediaUrl(String url) {
+        if (StringUtils.isBlank(url) || url.startsWith("http://") || url.startsWith("https://")) {
+            return url;
+        }
+        if (url.startsWith("/") && StringUtils.isNotBlank(appProperties.getTgSearch())) {
+            return appProperties.getTgSearch() + url;
+        }
+        return url;
+    }
+
     public List<Message> search(String keyword, int size, boolean web, boolean cached) {
+        return doSearch(keyword, size, web, cached, null);
+    }
+
+    /** 追剧搜索入口:盘搜/TG-Search 按订阅定向集({@link SearchTargets})定向,离线类型按磁力兜底开关;null = 观影全局口径。 */
+    public List<Message> search(String keyword, int size, boolean web, boolean cached, SearchTargets targets) {
+        return doSearch(keyword, size, web, cached, targets);
+    }
+
+    private List<Message> doSearch(String keyword, int size, boolean web, boolean cached, SearchTargets targets) {
         List<Message> results = List.of();
         List<TelegramChannel> channels = list().stream().filter(TelegramChannel::isValid).filter(TelegramChannel::isEnabled).toList();
+        int searchedChannelCount = channels.size();
         if (web) {
             channels = channels.stream().filter(TelegramChannel::isWebAccess).toList();
+            searchedChannelCount = channels.size();
         } else {
-            if (StringUtils.isNotBlank(keyword) && StringUtils.isNotBlank(appProperties.getPanSouUrl())) {
+            if (StringUtils.isNotBlank(appProperties.getPanSouUrl())) {
                 List<String> ids = channels.stream()
                         .map(TelegramChannel::getUsername)
                         .toList();
-                results = remoteSearchService.search(keyword, ids);
-            } else if (StringUtils.isNotBlank(appProperties.getTgSearch())) {
-                String search = channels.stream().map(TelegramChannel::getUsername).collect(Collectors.joining(","));
-                results = searchRemote(search, keyword, size);
+                searchedChannelCount = remoteSearchService.getSearchChannels(ids).size();
+                results = remoteSearchService.search(keyword, ids, targets);
+            }
+            if (results.isEmpty() && StringUtils.isNotBlank(appProperties.getTgSearch())) {
+                results = searchTgSearchApi(keyword, null, 1, size, tgSearchCloudTypes(targets)).messages();
             }
         }
 
         if (results.isEmpty()) {
-            if (client == null) {
-                channels = channels.stream().filter(TelegramChannel::isWebAccess).toList();
-            }
+            channels = channels.stream().filter(TelegramChannel::isWebAccess).toList();
+            searchedChannelCount = channels.size();
 
             List<Future<List<Message>>> futures = new ArrayList<>();
             for (var channel : channels) {
@@ -1251,9 +1418,88 @@ public class TelegramService {
             results = getResult(futures);
         }
 
+        List<Message> list = filterAndSort(results, targets);
+        log.info("Search {} get {} results from {} channels.", keyword, list.size(), searchedChannelCount);
+        return list;
+    }
+
+    /**
+     * 聚合搜索:盘搜 / TG-Search / 电报网页**同时**跑,按 link 去重合并。
+     * <p>
+     * 与 {@link #search(String, int, boolean, boolean)} 的回退链相反 —— 那条链"任一来源结果够用即停",
+     * 于是配了盘搜的部署里 TG-Search 与电报网页永远不会被调用,而电报网页恰恰是唯一不依赖外部实例的
+     * 内置来源。追更场景需要的是**最大召回**(资源不够时重复搜同一个源没有意义,结果不会变),
+     * 所以三路全开。任一路失败只记日志,不影响其它路。
+     */
+    /**
+     * 磁力专项搜索(追剧磁力兜底用):tg-search API 只请求 magnet/ed2k 离线类型
+     * (离线消费两种链接同权),不过 filterAndSort(其 tgDrivers 过滤会按用户配置剔除磁力)。
+     */
+    public List<Message> searchMagnets(String keyword, int size) {
+        if (StringUtils.isBlank(appProperties.getTgSearch())) {
+            return List.of();
+        }
+        List<Message> messages = searchTgSearchApi(keyword, null, 1, size, List.of("magnet", "ed2k")).messages();
+        log.info("magnet search {} get {} results", keyword, messages.size());
+        return messages;
+    }
+
+    /**
+     * 追剧聚合搜索:盘搜 / TG-Search / 电报网页**同时**跑,按 link 去重合并。
+     * <p>
+     * 与 {@link #search(String, int, boolean, boolean)} 的回退链相反 —— 那条链"任一来源结果够用即停",
+     * 于是配了盘搜的部署里 TG-Search 与电报网页永远不会被调用,而电报网页恰恰是唯一不依赖外部实例的
+     * 内置来源。追更场景需要的是**最大召回**(资源不够时重复搜同一个源没有意义,结果不会变),
+     * 所以三路全开。任一路失败只记日志,不影响其它路。
+     * <p>
+     * 定向口径({@link SearchTargets}):盘搜与 TG-Search 服务端 cloud_types 只请求生效盘
+     * (白名单空 = 全局口径不限);聚合出口的盘门禁在白名单非空时替换全局 tg.drivers,
+     * magnet/ed2k 按磁力兜底开关放行。
+     */
+    public List<Message> searchAggregated(String keyword, int size, boolean cached, SearchTargets targets) {
+        List<TelegramChannel> channels = list().stream()
+                .filter(TelegramChannel::isValid).filter(TelegramChannel::isEnabled).toList();
+        List<Future<List<Message>>> futures = new ArrayList<>();
+
+        if (StringUtils.isNotBlank(appProperties.getPanSouUrl())) {
+            List<String> ids = channels.stream().map(TelegramChannel::getUsername).toList();
+            futures.add(executorService.submit(() -> remoteSearchService.search(keyword, ids, targets)));
+        }
+        if (StringUtils.isNotBlank(appProperties.getTgSearch())) {
+            List<String> cloudTypes = tgSearchCloudTypes(targets);
+            futures.add(executorService.submit(() -> searchTgSearchApi(keyword, null, 1, size, cloudTypes).messages()));
+        }
+        for (var channel : channels.stream().filter(TelegramChannel::isWebAccess).toList()) {
+            String name = channel.getUsername();
+            futures.add(executorService.submit(
+                    () -> cached ? searchCache.get(name + "-false") : searchFromChannel(name, keyword, false, size)));
+        }
+
+        Map<String, Message> merged = new LinkedHashMap<>();
+        for (Message message : getResult(futures)) {
+            if (StringUtils.isNotBlank(message.getLink())) {
+                merged.putIfAbsent(message.getLink(), message);
+            }
+        }
+        List<Message> list = filterAndSort(merged.values().stream().toList(), targets);
+        log.info("Aggregated search {} get {} results ({} sources).", keyword, list.size(), futures.size());
+        return list;
+    }
+
+    /** 内容过滤(电子书/软件等非影视)与排序,回退链与聚合模式共用。 */
+    private List<Message> filterAndSort(List<Message> results) {
+        return filterAndSort(results, null);
+    }
+
+    /**
+     * 定向版盘门禁:追剧搜索传入 {@link SearchTargets} 时,盘白名单非空以白名单替换全局
+     * tg.drivers 门禁(订阅生效盘优先,防全局配置误杀扩展盘);白名单空时网盘维持全局口径,
+     * magnet/ed2k 按磁力兜底开关放行(未并入时保留全局口径既有放行,不收窄现状)。
+     */
+    private List<Message> filterAndSort(List<Message> results, SearchTargets targets) {
         List<String> tgDrivers = appProperties.getTgDrivers();
-        List<Message> list = results.stream()
-                .filter(e -> tgDrivers.isEmpty() || tgDrivers.contains(e.getType()))
+        return results.stream()
+                .filter(e -> typeAllowedBySearch(e.getType(), tgDrivers, targets))
                 .filter(e -> !e.getContent().toLowerCase().contains("pdf"))
                 .filter(e -> !e.getContent().toLowerCase().contains("epub"))
                 .filter(e -> !e.getContent().toLowerCase().contains("azw3"))
@@ -1266,12 +1512,51 @@ public class TelegramService {
                 .sorted(comparator())
                 .distinct()
                 .toList();
-        log.info("Search {} get {} results from {} channels.", keyword, list.size(), channels.size());
-        return list;
     }
 
-    private Comparator<Message> comparator() {
-        Comparator<Message> type = Comparator.comparing(a -> appProperties.getTgDriverOrder().indexOf(a.getType()));
+    private boolean typeAllowedBySearch(String type, List<String> tgDrivers, SearchTargets targets) {
+        boolean globalAllowed = tgDrivers.isEmpty() || tgDrivers.contains(type);
+        return targets == null ? globalAllowed : targets.allowsType(type, globalAllowed);
+    }
+
+    /**
+     * tg-search cloud_types 定向覆盖:盘白名单非空按白名单映射,否则全局 tg.drivers(现状);
+     * 磁力兜底生效追加 magnet/ed2k。pan 部分为空返回 null(不覆盖 —— 不限模式服务端本就
+     * 返回离线类型,单发离线列表会把网盘结果裁光)。
+     */
+    private List<String> tgSearchCloudTypes(SearchTargets targets) {
+        if (targets == null) {
+            return null;
+        }
+        List<String> base;
+        if (targets.drives().isEmpty()) {
+            base = getTgSearchCloudTypes(null);
+        } else {
+            base = targets.drives().stream()
+                    .map(DriveId::toTypeLeniently)
+                    .filter(Objects::nonNull)
+                    .map(type -> getCloudType(String.valueOf(type)))
+                    .filter(StringUtils::isNotBlank)
+                    .distinct()
+                    .toList();
+        }
+        if (base.isEmpty()) {
+            return null;
+        }
+        if (!targets.offlineIncluded()) {
+            return base;
+        }
+        List<String> withOffline = new ArrayList<>(base);
+        if (!withOffline.contains("magnet")) {
+            withOffline.add("magnet");
+        }
+        if (!withOffline.contains("ed2k")) {
+            withOffline.add("ed2k");
+        }
+        return withOffline;
+    }
+
+    private Comparator<Message> comparator() {        Comparator<Message> type = Comparator.comparing(a -> appProperties.getTgDriverOrder().indexOf(a.getType()));
         return switch (appProperties.getTgSortField()) {
             case "type" -> type.thenComparing(Comparator.comparing(Message::getTime).reversed());
             case "name" -> Comparator.comparing(Message::getName);
@@ -1286,7 +1571,9 @@ public class TelegramService {
         if (!api.endsWith("/search")) {
             api = api + "/search";
         }
-        String url = api + "?channels=" + channels + "&query=" + keyword + "&size=" + size + "&timeout=" + appProperties.getTgTimeout();
+        // keyword 硬拼 URL:含 & / # 的词会把 query 截断或注入参数,须编码
+        String url = api + "?channels=" + channels + "&query=" + URLEncoder.encode(keyword, StandardCharsets.UTF_8)
+                + "&size=" + size + "&timeout=" + appProperties.getTgTimeout();
         try {
             var response = restTemplate.getForObject(url, SearchResponse.class);
             return response.getMessages().stream().flatMap(this::parseMessage).toList();
@@ -1294,6 +1581,194 @@ public class TelegramService {
             log.warn("", e);
         }
         return List.of();
+    }
+
+    private TgSearchResult searchTgSearchApi(String keyword, String cloudType, int page, int size) {
+        return searchTgSearchApi(keyword, cloudType, page, size, null);
+    }
+
+    /** cloudTypesOverride 非空(含空表)时替换默认 cloud_types 推导(null = 按 cloudType/全局 tg.drivers)。 */
+    private TgSearchResult searchTgSearchApi(String keyword, String cloudType, int page, int size,
+                                             List<String> cloudTypesOverride) {
+        int safePage = Math.max(1, page);
+        int safeSize = Math.max(1, size);
+        if (StringUtils.isBlank(appProperties.getTgSearch())) {
+            return new TgSearchResult(List.of(), 0);
+        }
+        int offset = (safePage - 1) * safeSize;
+        ObjectNode body = objectMapper.createObjectNode()
+                .put("kw", StringUtils.defaultString(keyword))
+                .put("res", "merge")
+                .put("include_image", true)
+                .put("include_media_metadata", true)
+                .put("limit", safeSize)
+                .put("offset", offset);
+        List<String> cloudTypes = cloudTypesOverride != null ? cloudTypesOverride : getTgSearchCloudTypes(cloudType);
+        if (!cloudTypes.isEmpty()) {
+            ArrayNode cloudTypesNode = objectMapper.createArrayNode();
+            cloudTypes.forEach(cloudTypesNode::add);
+            body.set("cloud_types", cloudTypesNode);
+        }
+        String url = normalizeTgSearchUrl("/api/search");
+        try {
+            log.debug("search TG-Search url: {}", url);
+            HttpHeaders headers = buildTgSearchHeaders();
+            headers.setContentType(MediaType.APPLICATION_JSON);
+            HttpEntity<ObjectNode> entity = new HttpEntity<>(body, headers);
+            var response = restTemplate.exchange(url, HttpMethod.POST, entity, ObjectNode.class).getBody();
+            return parseTgSearchResponse(response);
+        } catch (Exception e) {
+            log.warn("", e);
+        }
+        return new TgSearchResult(List.of(), 0);
+    }
+
+    private List<String> getTgSearchCloudTypes(String cloudType) {
+        if (StringUtils.isNotBlank(cloudType)) {
+            return List.of(cloudType);
+        }
+        List<String> tgDrivers = appProperties.getTgDrivers();
+        if (tgDrivers == null || tgDrivers.isEmpty()) {
+            return List.of();
+        }
+        return tgDrivers.stream()
+                .map(this::getCloudType)
+                .filter(StringUtils::isNotBlank)
+                .distinct()
+                .toList();
+    }
+
+    private HttpHeaders buildTgSearchHeaders() {
+        HttpHeaders headers = new HttpHeaders();
+        if (StringUtils.isNotBlank(appProperties.getTgSearchApiKey())) {
+            headers.set(HttpHeaders.AUTHORIZATION, appProperties.getTgSearchApiKey());
+        }
+        return headers;
+    }
+
+    private String normalizeTgSearchUrl(String path) {
+        String api = StringUtils.defaultString(appProperties.getTgSearch());
+        while (api.endsWith("/")) {
+            api = api.substring(0, api.length() - 1);
+        }
+        return api + path;
+    }
+
+    private TgSearchResult parseTgSearchResponse(ObjectNode response) {
+        if (response == null) {
+            return new TgSearchResult(List.of(), 0);
+        }
+        int total = response.path("data").path("total").asInt(0);
+        JsonNode mergedByType = response.path("data").path("merged_by_type");
+        if (!mergedByType.isObject()) {
+            return new TgSearchResult(List.of(), total);
+        }
+        List<Message> messages = new ArrayList<>();
+        Iterator<Map.Entry<String, JsonNode>> fields = mergedByType.fields();
+        while (fields.hasNext()) {
+            Map.Entry<String, JsonNode> entry = fields.next();
+            String type = getMessageType(entry.getKey());
+            if (type == null || !entry.getValue().isArray()) {
+                continue;
+            }
+            for (JsonNode link : entry.getValue()) {
+                String url = appendTgSearchPassword(link.path("url").asText(""), link.path("password").asText(""));
+                if (StringUtils.isBlank(url)) {
+                    continue;
+                }
+                List<String> images = new ArrayList<>();
+                link.path("images").forEach(image -> {
+                    if (image.isTextual()) {
+                        images.add(image.asText());
+                    }
+                });
+                Map<String, Object> media = objectMapper.convertValue(link.path("media"), new TypeReference<>() {
+                });
+                Long size = link.path("size").asLong();
+                messages.add(new Message(
+                        type,
+                        url,
+                        size,
+                        link.path("note").asText(""),
+                        parseInstant(link.path("datetime").asText(null)),
+                        images,
+                        media
+                ));
+            }
+        }
+        return new TgSearchResult(messages, total);
+    }
+
+    private String appendTgSearchPassword(String url, String password) {
+        if (StringUtils.isBlank(url) || StringUtils.isBlank(password) || ShareService.PASSWORD.matcher(url).find()) {
+            return url;
+        }
+        String encodedPassword = URLEncoder.encode(password.trim(), StandardCharsets.UTF_8);
+        int fragmentIndex = url.indexOf('#');
+        String base = fragmentIndex >= 0 ? url.substring(0, fragmentIndex) : url;
+        String fragment = fragmentIndex >= 0 ? url.substring(fragmentIndex) : "";
+        String separator = base.contains("?") ? "&" : "?";
+        return base + separator + "password=" + encodedPassword + fragment;
+    }
+
+    private Instant parseInstant(String value) {
+        if (StringUtils.isBlank(value)) {
+            return Instant.now();
+        }
+        try {
+            return Instant.parse(value);
+        } catch (Exception e) {
+            return Instant.now();
+        }
+    }
+
+    private String getMessageType(String type) {
+        if (type == null) {
+            return null;
+        }
+        return switch (type) {
+            case "aliyun", "ali" -> "0";
+            case "pikpak" -> "1";
+            case "xunlei" -> "2";
+            case "123" -> "3";
+            case "quark" -> "5";
+            case "mobile" -> "6";
+            case "uc" -> "7";
+            case "115" -> "8";
+            case "tianyi" -> "9";
+            case "baidu" -> "10";
+            case "guangya" -> "12";
+            case "magnet" -> "magnet";
+            case "ed2k" -> "ed2k";
+            case "video" -> "video";
+            default -> null;
+        };
+    }
+
+    private String getCloudType(String type) {
+        if (type == null) {
+            return null;
+        }
+        return switch (type) {
+            case "0" -> "aliyun";
+            case "1" -> "pikpak";
+            case "2" -> "xunlei";
+            case "3" -> "123";
+            case "5" -> "quark";
+            case "6" -> "mobile";
+            case "7" -> "uc";
+            case "8" -> "115";
+            case "9" -> "tianyi";
+            case "10" -> "baidu";
+            case "12" -> "guangya";
+            case "magnet" -> "magnet";
+            case "ed2k" -> "ed2k";
+            case "video" -> "video";
+            default -> null;
+        };
+    }
+
+    private record TgSearchResult(List<Message> messages, int total) {
     }
 
     private List<Message> getResult(List<Future<List<Message>>> futures) {
@@ -1309,7 +1784,11 @@ public class TelegramService {
                 results.addAll(result);
             } catch (TimeoutException e) {
                 incompleteFutures.add(future);
-            } catch (InterruptedException | ExecutionException e) {
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                log.warn("Interrupted while waiting for search results", e);
+                incompleteFutures.add(future);
+            } catch (ExecutionException e) {
                 log.warn("", e);
             }
         }
@@ -1321,7 +1800,10 @@ public class TelegramService {
                 try {
                     results.addAll(future.get());
                     iterator.remove();
-                } catch (InterruptedException | ExecutionException e) {
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    log.warn("Interrupted while retrieving completed future", e);
+                } catch (ExecutionException e) {
                     log.warn("", e);
                 }
             }
@@ -1354,83 +1836,24 @@ public class TelegramService {
     }
 
     public List<Message> searchFromChannel(String username, String keyword, boolean web, int size) throws IOException {
-        if (web || client == null) {
-            List<Message> list = searchFromWeb(username, keyword, "");
-            List<Message> result = list.stream().filter(e -> e.getType() != null).toList();
-            log.info("Search {} from web {} get {} results.", keyword, username, result.size());
-            return result;
-        }
-        List<Message> result = List.of();
-
-        try {
-            InputPeer inputPeer = cache.get(username);
-            int minDate = (int) (Instant.now().minus(90, ChronoUnit.DAYS).truncatedTo(ChronoUnit.DAYS).toEpochMilli() / 1000);
-            Messages messages = client.getServiceHolder().getChatService().search(ImmutableSearch.of(inputPeer, keyword, InputMessagesFilterEmpty.instance(), minDate, 0, 0, 0, size, 0, 0, 0)).block();
-            if (messages instanceof ChannelMessages) {
-                result = ((ChannelMessages) messages).messages().stream().filter(e -> e instanceof BaseMessage).map(BaseMessage.class::cast).flatMap(e -> parseMessage(username, e)).toList();
-            }
-            log.info("Search {} from {} get {} results.", keyword, username, result.size());
-        } catch (Exception e) {
-            log.warn("search from channel {} failed", username, e);
-        }
+        List<Message> list = searchFromWeb(username, keyword, "");
+        List<Message> result = list.stream().filter(e -> e.getType() != null).toList();
+        log.info("Search {} from web {} get {} results.", keyword, username, result.size());
         return result;
     }
 
     public TelegramChannel getChannelByName(String username) {
-        if (client == null) {
-            TelegramChannel channel = new TelegramChannel();
-            channel.setId(telegramChannelRepository.count());
-            channel.setUsername(username);
-            channel.setTitle(username);
-            return channel;
+        // 真查库:new 旧行为是每次 new 一条(id=count()),create() 反复调用同 username 会插重复行,
+        // id=count() 与 channels.json 显式 id 撞车时 save 变更新静默覆盖已有频道配置
+        TelegramChannel existing = telegramChannelRepository.findByUsername(username);
+        if (existing != null) {
+            return existing;
         }
-
-        try {
-            var resolvedPeer = client.getServiceHolder().getUserService().resolveUsername(username).block();
-            var chat = resolvedPeer.chats().get(0);
-            TelegramChannel channel = null;
-            if (chat instanceof Channel) {
-                channel = new TelegramChannel((Channel) chat);
-            } else if (chat instanceof BaseChat) {
-                channel = new TelegramChannel((BaseChat) chat);
-            }
-            return channel;
-        } catch (Exception e) {
-            throw new BadRequestException("用户名无效", e);
-        }
-    }
-
-    private InputPeer resolveUsername(String username) {
-        var resolvedPeer = client.getServiceHolder().getUserService().resolveUsername(username).block();
-        var chat = resolvedPeer.chats().get(0);
-        InputPeer inputPeer = null;
-        if (chat instanceof Channel channel) {
-            inputPeer = ImmutableInputPeerChannel.of(chat.id(), channel.accessHash());
-        } else if (chat instanceof BaseChat) {
-            inputPeer = ImmutableInputPeerChat.of(chat.id());
-        }
-        return inputPeer;
-    }
-
-    private Stream<Message> parseMessage(String channel, telegram4j.tl.BaseMessage message) {
-        List<Message> list = new ArrayList<>();
-        for (String link : Message.parseLinks(message.message())) {
-            list.add(new Message(channel, message, link));
-        }
-
-        if (message.entities() != null) {
-            List<String> urls = message.entities()
-                    .stream()
-                    .filter(e -> e instanceof MessageEntityTextUrl)
-                    .map(e -> (MessageEntityTextUrl) e)
-                    .map(MessageEntityTextUrl::url)
-                    .toList();
-            for (String link : Message.parseLinks(urls)) {
-                list.add(new Message(channel, message, link));
-            }
-        }
-
-        return list.stream();
+        TelegramChannel channel = new TelegramChannel();
+        channel.setId(telegramChannelRepository.count());
+        channel.setUsername(username);
+        channel.setTitle(username);
+        return channel;
     }
 
     private Stream<Message> parseMessage(SearchResult result) {
@@ -1446,8 +1869,11 @@ public class TelegramService {
 
         String html = getHtml(url);
 
+        return parseWebMessages(Jsoup.parse(html), username);
+    }
+
+    List<Message> parseWebMessages(Document doc, String username) {
         List<Message> list = new ArrayList<>();
-        Document doc = Jsoup.parse(html);
         Elements elements = doc.select("div.tgme_container div.tgme_widget_message_wrap");
         for (Element element : elements) {
             Element photo = element.selectFirst("a.tgme_widget_message_photo_wrap");
@@ -1456,7 +1882,14 @@ public class TelegramService {
                 String style = photo.attr("style");
                 cover = style.replaceAll(".*background-image:url\\('(.*?)'\\).*", "$1");
             }
-            String id = element.selectFirst(".tgme_widget_message").attr("data-post").split("/")[1];
+            Element message = element.selectFirst(".tgme_widget_message");
+            String post = message != null ? message.attr("data-post") : "";
+            String[] parts = post.split("/");
+            if (parts.length < 2 || !parts[1].matches("\\d+")) {
+                log.debug("Skip message with invalid data-post '{}'", post);
+                continue;
+            }
+            String id = parts[1];
             Element elTime = element.selectFirst("time");
             String time = elTime != null ? elTime.attr("datetime") : null;
             list.add(new Message(Integer.parseInt(id), username, getTextWithNewlines(element.select(".tgme_widget_message_text").first()), time, cover));
@@ -1487,7 +1920,9 @@ public class TelegramService {
 
         int total = 0;
         List<String> result = new ArrayList<>();
+        int index = 0;
         for (Future<List<String>> future : futures) {
+            String currentChannel = channels[index++];
             try {
                 List<String> list = future.get(appProperties.getTgTimeout(), TimeUnit.MILLISECONDS);
                 total += list.size();
@@ -1499,6 +1934,8 @@ public class TelegramService {
                     }
                 }
             } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                log.warn("Search interrupted for channel: {}", currentChannel);
                 break;
             } catch (ExecutionException | TimeoutException e) {
                 log.warn("", e);
@@ -1536,24 +1973,40 @@ public class TelegramService {
                 .addHeader("Referer", "https://t.me/")
                 .build();
 
+        // Use try-with-resources to ensure response is always closed
         Call call = httpClient.newCall(request);
-        Response response = call.execute();
-        String html = response.body().string();
-        response.close();
-
-        return html;
-    }
-
-    @PreDestroy
-    public void disconnect() {
-        client.disconnect().block();
+        try (Response response = call.execute()) {
+            if (response.body() == null) {
+                throw new IOException("Response body is null for URL: " + url);
+            }
+            return response.body().string();
+        }
     }
 
     public List<TelegramChannel> updateAll(List<TelegramChannel> channels) {
         int order = 1;
         for (var channel : channels) {
-            channel.setOrder(order++);
+            channel.setSortOrder(order++);
         }
         return telegramChannelRepository.saveAll(channels);
+    }
+
+    @PreDestroy
+    public void cleanup() {
+        log.info("Shutting down TelegramService executor service");
+        executorService.shutdown();
+        try {
+            if (!executorService.awaitTermination(60, TimeUnit.SECONDS)) {
+                log.warn("Executor service did not terminate in time, forcing shutdown");
+                executorService.shutdownNow();
+                if (!executorService.awaitTermination(60, TimeUnit.SECONDS)) {
+                    log.error("Executor service did not terminate after forced shutdown");
+                }
+            }
+        } catch (InterruptedException e) {
+            log.warn("Interrupted while waiting for executor service to terminate", e);
+            executorService.shutdownNow();
+            Thread.currentThread().interrupt();
+        }
     }
 }

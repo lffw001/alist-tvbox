@@ -1,8 +1,12 @@
 package cn.har01d.alist_tvbox.web;
 
+import cn.har01d.alist_tvbox.config.AppProperties;
 import cn.har01d.alist_tvbox.domain.DriverType;
+import cn.har01d.alist_tvbox.entity.Account;
 import cn.har01d.alist_tvbox.entity.AccountRepository;
+import cn.har01d.alist_tvbox.entity.DriverAccount;
 import cn.har01d.alist_tvbox.entity.DriverAccountRepository;
+import cn.har01d.alist_tvbox.entity.PikPakAccount;
 import cn.har01d.alist_tvbox.entity.PikPakAccountRepository;
 import cn.har01d.alist_tvbox.entity.Setting;
 import cn.har01d.alist_tvbox.entity.SettingRepository;
@@ -21,12 +25,14 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Map;
+import java.util.Optional;
 
 @Slf4j
 @RestController
 @RequestMapping("/pg")
 public class PgTokenController {
     private final SubscriptionService subscriptionService;
+    private final AppProperties appProperties;
     private final AccountRepository accountRepository;
     private final SettingRepository settingRepository;
     private final DriverAccountRepository driverAccountRepository;
@@ -35,6 +41,7 @@ public class PgTokenController {
     private final ObjectMapper objectMapper;
 
     public PgTokenController(SubscriptionService subscriptionService,
+                             AppProperties appProperties,
                              AccountRepository accountRepository,
                              SettingRepository settingRepository,
                              DriverAccountRepository driverAccountRepository,
@@ -42,6 +49,7 @@ public class PgTokenController {
                              FileDownloader fileDownloader,
                              ObjectMapper objectMapper) {
         this.subscriptionService = subscriptionService;
+        this.appProperties = appProperties;
         this.accountRepository = accountRepository;
         this.settingRepository = settingRepository;
         this.driverAccountRepository = driverAccountRepository;
@@ -63,19 +71,36 @@ public class PgTokenController {
 
     @GetMapping("/lib/tokenm")
     public ObjectNode tokenm(String token) throws Exception {
-        subscriptionService.checkToken(token);
+        // 按 token 归属过滤:共享 token=管理员设备→全部 master 凭证;
+        // u- 形态须带密钥(u-{username}-{vod_secret})验真才回本人账号凭证 —— 裸 u-{username}
+        // 用户名可猜测,不能当授权(全局账号凭证也绝不下发给普通用户,只能经服务端代理使用)
+        int uid = subscriptionService.credentialAuthorityUidFor(token);
+        if (uid < 0) {
+            subscriptionService.requireSubscriptionToken(token);
+            uid = 0;
+        }
 
         String json = Files.readString(Utils.getWebPath("pg", "lib", "tokentemplate.json"));
 
         ObjectNode objectNode = (ObjectNode) objectMapper.readTree(json);
 
-        accountRepository.getFirstByMasterTrue().ifPresent(account -> {
+        // tokenm 是 PG/猫源插件主动拉取的配置,授权=持有合法订阅 token;凭证下发受矩阵 pg 行
+        // 控制(pg 行默认开,总开关关则全停,#1084)。data/tokenm.json 是管理员手工维护的
+        // 覆盖文件,不受矩阵控制原样合并。
+        if (appProperties.allowPluginDrive("pg", "ali")) {
+        aliAccount(uid).ifPresent(account -> {
             objectNode.put("token", account.getRefreshToken());
             objectNode.put("open_token", account.getOpenToken());
         });
-        settingRepository.findById(Constants.OPEN_TOKEN_URL).map(Setting::getValue).ifPresent(url -> objectNode.put("open_api_url", url));
-        driverAccountRepository.findByTypeAndMasterTrue(DriverType.QUARK).stream().findFirst().ifPresent(share -> objectNode.put("quark_cookie", share.getCookie()));
-        driverAccountRepository.findByTypeAndMasterTrue(DriverType.PAN115).stream().findFirst().ifPresent(share -> {
+        if (uid == 0) {
+            settingRepository.findById(Constants.OPEN_TOKEN_URL).map(Setting::getValue).ifPresent(url -> objectNode.put("open_api_url", url));
+        }
+        }
+        if (appProperties.allowPluginDrive("pg", "quark")) {
+        account(DriverType.QUARK, uid).ifPresent(share -> objectNode.put("quark_cookie", share.getCookie()));
+        }
+        if (appProperties.allowPluginDrive("pg", "115")) {
+        account(DriverType.PAN115, uid).ifPresent(share -> {
             objectNode.put("pan115_cookie", share.getCookie());
             try {
                 objectNode.put("pan115_delete_code", objectMapper.readTree(share.getAddition()).get("delete_code").asText());
@@ -83,32 +108,48 @@ public class PgTokenController {
                 log.warn("", e);
             }
         });
-        driverAccountRepository.findByTypeAndMasterTrue(DriverType.UC).stream().findFirst().ifPresent(share -> objectNode.put("uc_cookie", share.getCookie()));
-        driverAccountRepository.findByTypeAndMasterTrue(DriverType.PAN123).stream().findFirst().ifPresent(share -> {
+        }
+        if (appProperties.allowPluginDrive("pg", "uc")) {
+        account(DriverType.UC, uid).ifPresent(share -> objectNode.put("uc_cookie", share.getCookie()));
+        }
+        if (appProperties.allowPluginDrive("pg", "baidu")) {
+        account(DriverType.BAIDU, uid).ifPresent(share -> objectNode.put("baidu_cookie", share.getCookie()));
+        }
+        if (appProperties.allowPluginDrive("pg", "123")) {
+        account(DriverType.PAN123, uid).ifPresent(share -> {
             objectNode.put("pan123_username", share.getUsername());
             objectNode.put("pan123_password", share.getPassword());
             objectNode.put("pan123_flags", "4kz");
         });
-        driverAccountRepository.findByTypeAndMasterTrue(DriverType.CLOUD189).stream().findFirst().ifPresent(share -> {
+        }
+        if (appProperties.allowPluginDrive("pg", "189")) {
+        account(DriverType.CLOUD189, uid).ifPresent(share -> {
             objectNode.put("pan189_username", share.getUsername());
             objectNode.put("pan189_password", share.getPassword());
             objectNode.put("pan189_flags", "4kz");
         });
-        driverAccountRepository.findByTypeAndMasterTrue(DriverType.PAN139).stream().findFirst().ifPresent(share -> {
+        }
+        if (appProperties.allowPluginDrive("pg", "139")) {
+        account(DriverType.PAN139, uid).ifPresent(share -> {
             objectNode.put("yd_auth", "Basic " + share.getToken());
             objectNode.put("yd_thread_limit", 4);
             objectNode.put("yd_flags", "auto|4kz");
             objectNode.put("yd_danmu", true);
         });
-        driverAccountRepository.findByTypeAndMasterTrue(DriverType.THUNDER).stream().findFirst().ifPresent(share -> {
+        }
+        if (appProperties.allowPluginDrive("pg", "xunlei")) {
+        account(DriverType.THUNDER, uid).ifPresent(share -> {
             objectNode.put("thunder_username", share.getUsername());
             objectNode.put("thunder_password", share.getPassword());
             objectNode.put("thunder_captchatoken", share.getToken());
         });
-        pikPakAccountRepository.getFirstByMasterTrue().ifPresent(account -> {
+        }
+        if (appProperties.allowPluginDrive("pg", "pikpak")) {
+        pikpakAccount(uid).ifPresent(account -> {
             objectNode.put("pikpak_username", account.getUsername());
             objectNode.put("pikpak_password", account.getPassword());
         });
+        }
 
         Path path = Utils.getDataPath("tokenm.json");
         if (Files.exists(path)) {
@@ -121,5 +162,21 @@ public class PgTokenController {
         }
 
         return objectNode;
+    }
+
+    private Optional<Account> aliAccount(int uid) {
+        return uid == 0 ? accountRepository.getFirstByMasterTrue()
+                : accountRepository.findFirstByOwnerUidOrderByIdAsc(uid);
+    }
+
+    private Optional<PikPakAccount> pikpakAccount(int uid) {
+        return uid == 0 ? pikPakAccountRepository.getFirstByMasterTrue()
+                : pikPakAccountRepository.findFirstByOwnerUidOrderByIdAsc(uid);
+    }
+
+    /** uid=0(共享 token)取全局 master 账号;否则取该用户自己的账号。 */
+    private Optional<DriverAccount> account(DriverType type, int uid) {
+        return uid == 0 ? driverAccountRepository.findByTypeAndMasterTrue(type)
+                : driverAccountRepository.findFirstByOwnerUidAndTypeOrderByIdAsc(uid, type);
     }
 }

@@ -1,27 +1,28 @@
 <template>
-  <div class="sites">
-    <div class="flex">
-      <div v-if="userInfo">
-        <span v-if="userInfo.uname">用户名：{{ userInfo.uname }}</span>
-        <span class="hint">登录状态：{{ userInfo.isLogin ? '已登录' : '未登录' }}</span>
-        <span v-if="userInfo.uname" class="hint">会员状态：{{
-            userInfo.vipType ? userInfo.vip_label.text : '无会员'
-          }}</span>
-      </div>
-      <div class="">
+  <div class="page-container">
+    <div class="page-header">
+      <h1 class="page-title">BiliBili管理</h1>
+      <div class="page-actions">
+        <div v-if="userInfo">
+          <span v-if="userInfo.uname">用户名：{{ userInfo.uname }}</span>
+          <span style="margin-left: 12px">登录状态：{{ userInfo.isLogin ? '已登录' : '未登录' }}</span>
+          <span v-if="userInfo.uname" style="margin-left: 12px">会员状态：{{
+              userInfo.vipType ? userInfo.vip_label.text : '无会员'
+            }}</span>
+        </div>
         <el-button type="primary" @click="scanLogin">登录</el-button>
         <el-button type="primary" @click="settingVisible=true">配置</el-button>
       </div>
     </div>
 
-    <h1>分类列表</h1>
-    <el-row justify="end">
-      <span style="margin-right: 16px">可以拖动行排序</span>
+    <div class="page-card">
+    <div class="table-scroll-wrapper">
+    <div style="margin-bottom: 12px; display: flex; justify-content: flex-end; gap: 12px;">
+      <span v-if="channelDragEnabled">可以拖动行排序</span>
       <el-button @click="load">刷新</el-button>
       <el-button type="primary" :disabled="!changed" @click="handleSave">保存</el-button>
       <el-button type="primary" @click="handleAdd">添加</el-button>
-    </el-row>
-    <div class="space"></div>
+    </div>
 
     <el-table :data="list"
               :row-class-name="tableRowClassName"
@@ -30,7 +31,7 @@
               style="width: 100%">
       <el-table-column prop="order" label="顺序" sortable width="100">
         <template #default="scope">
-          <span class="pointer">{{ scope.row.order }}</span>
+          <span :class="channelDragEnabled ? 'pointer' : 'order-text'">{{ scope.row.order }}</span>
         </template>
       </el-table-column>
       <el-table-column prop="id" label="ID" sortable width="100"/>
@@ -70,6 +71,9 @@
         </template>
       </el-table-column>
     </el-table>
+    </div>
+    </div>
+  </div>
 
     <el-dialog v-model="formVisible" :title="dialogTitle">
       <el-form label-width="140" :model="form">
@@ -138,8 +142,12 @@
         <el-form-item label="登录Cookie" label-width="120">
           <el-input v-model="bilibiliCookie" type="textarea" :rows="5"/>
         </el-form-item>
+        <el-form-item label="Refresh Token" label-width="120">
+          <el-input v-model="bilibiliRefreshToken" type="textarea" :rows="2"/>
+        </el-form-item>
         <el-form-item>
           <el-button type="primary" @click="updateBilibiliCookie">更新</el-button>
+          <el-button type="primary" @click="refreshBilibiliCookie">强制刷新</el-button>
         </el-form-item>
         <el-form-item label="上报播放记录">
           <el-switch
@@ -166,6 +174,16 @@
             active-text="开启"
             inactive-text="关闭"
             @change="updateDash"
+          />
+          <span class="hint">1080P+/4K/HDR 需要 dash;对 T4 接口同样生效(出代理化 MPD),但 T4 壳子内核须支持音视频分离(exo 系),普通壳子播不出。</span>
+        </el-form-item>
+        <el-form-item label="点赞投币收藏单独线路">
+          <el-switch
+            v-model="actionSeparateLine"
+            inline-prompt
+            active-text="开启"
+            inactive-text="关闭"
+            @change="updateActionSeparateLine"
           />
         </el-form-item>
 <!--        <el-form-item label="视频格式">-->
@@ -204,8 +222,6 @@
       </span>
       </template>
     </el-dialog>
-
-  </div>
 </template>
 
 <script setup lang="ts">
@@ -214,6 +230,7 @@ import Sortable from "sortablejs"
 import {Check, Close} from '@element-plus/icons-vue'
 import axios from "axios"
 import {ElMessage} from "element-plus";
+import {isPluginDragEnabledForUserAgent} from "@/utils/pluginDragSupport.mjs";
 
 const columns = [
   {title: "ID", key: "id", dataKey: "id"},
@@ -253,11 +270,13 @@ const base64QrCode = ref('')
 const qrcodeKey = ref('')
 const qns = ref(['16', '32', '64', '74', '80', '112', '116', '120', '125', '126', '127'])
 const bilibiliCookie = ref('')
+const bilibiliRefreshToken = ref('')
 const checks = ref<boolean[]>([true, true, true, false, true, true])
 const userInfo = ref<any>({})
 const heartbeat = ref(false)
 const searchable = ref(false)
 const dash = ref(false)
+const actionSeparateLine = ref(false)
 const updateAction = ref(false)
 const dialogTitle = ref('')
 const list = ref<Nav[]>([])
@@ -268,6 +287,8 @@ const settingVisible = ref(false)
 const loginVisible = ref(false)
 const changed = ref(false)
 const tableKey = ref(0)
+const channelDragEnabled = isPluginDragEnabledForUserAgent(window.navigator.userAgent)
+let channelSortable: Sortable | null = null
 const form = ref<Nav>({
   id: 0,
   name: '',
@@ -297,8 +318,14 @@ const treeToTile = (treeData: Nav[]) => {
 }
 
 const rowDrop = () => {
+  if (!channelDragEnabled) {
+    channelSortable?.destroy()
+    channelSortable = null
+    return
+  }
   const tbody = document.querySelector(".el-table__body-wrapper tbody") as HTMLElement;
-  Sortable.create(tbody, {
+  channelSortable?.destroy()
+  channelSortable = Sortable.create(tbody, {
     animation: 500,
     handle: ".el-table__row",
     draggable: ".el-table__row",
@@ -416,8 +443,19 @@ const handleSave = () => {
 }
 
 const updateBilibiliCookie = () => {
-  axios.post('/api/settings', {name: 'bilibili_cookie', value: bilibiliCookie.value}).then(() => {
+  axios.post('/api/bilibili/cookie', {cookie: bilibiliCookie.value, refreshToken: bilibiliRefreshToken.value}).then(() => {
     ElMessage.success('更新成功')
+    getBilibiliCookie()
+    getBilibiliRefreshToken()
+    loadUser()
+  })
+}
+
+const refreshBilibiliCookie = () => {
+  axios.post('/api/bilibili/refresh').then(() => {
+    ElMessage.success('已触发刷新检查')
+    getBilibiliCookie()
+    getBilibiliRefreshToken()
     loadUser()
   })
 }
@@ -437,6 +475,12 @@ const updateSearchable = () => {
 
 const updateDash = () => {
   axios.post('/api/settings', {name: 'bilibili_dash', value: dash.value + ''}).then(() => {
+    ElMessage.success('更新成功')
+  })
+}
+
+const updateActionSeparateLine = () => {
+  axios.post('/api/settings', {name: 'bilibili_action_separate_line', value: actionSeparateLine.value + ''}).then(() => {
     ElMessage.success('更新成功')
   })
 }
@@ -542,9 +586,21 @@ const getDash = () => {
   })
 }
 
+const getActionSeparateLine = () => {
+  axios.get('/api/settings/bilibili_action_separate_line').then(({data}) => {
+    actionSeparateLine.value = data.value === 'true'
+  })
+}
+
 const getBilibiliCookie = () => {
   axios.get('/api/settings/bilibili_cookie').then(({data}) => {
     bilibiliCookie.value = data.value
+  })
+}
+
+const getBilibiliRefreshToken = () => {
+  axios.get('/api/settings/bilibili_token').then(({data}) => {
+    bilibiliRefreshToken.value = data?.value || ''
   })
 }
 
@@ -590,7 +646,9 @@ onMounted(() => {
   getHeartbeat()
   getSearchable()
   getBilibiliCookie()
+  getBilibiliRefreshToken()
   getDash()
+  getActionSeparateLine()
   getQn()
   load().then(() => {
     rowDrop()
@@ -620,5 +678,9 @@ onMounted(() => {
 
 .pointer {
   cursor: pointer;
+}
+
+.order-text {
+  cursor: default;
 }
 </style>

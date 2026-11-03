@@ -1,0 +1,74 @@
+package cn.har01d.alist_tvbox.entity;
+
+import cn.har01d.alist_tvbox.model.PluginFilterConfigSchema;
+import com.fasterxml.jackson.annotation.JsonIgnore;
+import jakarta.persistence.*;
+import lombok.Getter;
+import lombok.RequiredArgsConstructor;
+import lombok.Setter;
+import lombok.ToString;
+
+import java.time.OffsetDateTime;
+
+@Getter
+@Setter
+@ToString
+@RequiredArgsConstructor
+@Entity
+@TableGenerator(name = "tableGenerator", table = "id_generator", pkColumnName = "entity_name", valueColumnName = "next_id", allocationSize = 1)
+@Table(indexes = {
+    @Index(name = "idx_plugin_external_id", columnList = "external_id"),
+    @Index(name = "idx_plugin_url", columnList = "url")
+})
+public class Plugin {
+    @Id
+    @GeneratedValue(strategy = GenerationType.TABLE, generator = "tableGenerator")
+    private Integer id;
+
+    private String name;
+
+    @Column(name = "external_id")
+    private String externalId;
+
+    @Column(columnDefinition = "TEXT")
+    private String url;
+
+    private boolean enabled = true;
+
+    /** T4 接口可见性(false = 不进 /t4 配置,五动作 404;订阅源管理「T4」开关)。 */
+    @Column(name = "t4_visible", nullable = false)
+    private boolean t4Visible = true;
+
+    /** T4 详情增强三态(NULL=跟随全局开关+短剧/音乐源自动检测;TRUE=强制增强;FALSE=永不增强)。 */
+    @Column(name = "detail_enhance")
+    private Boolean detailEnhance;
+
+    @Column(name = "sort_order")
+    private Integer sortOrder;
+
+    @Column(name = "\"extend\"", columnDefinition = "TEXT")
+    private String extend;
+
+    @Column(name = "source_name")
+    private String sourceName;
+
+    @Column(name = "local_path")
+    private String localPath;
+
+    @JsonIgnore
+    @Column(columnDefinition = "TEXT")
+    private String content;
+
+    @Column(name = "\"version\"")
+    private Integer version;
+
+    @Column(name = "last_checked_at")
+    private OffsetDateTime lastCheckedAt;
+
+    @Column(name = "last_error", columnDefinition = "TEXT")
+    private String lastError;
+
+    // 运行时临时字段，不入库。由 PluginService 从脚本内容解析后挂载，供前端生成可视化配置表单。
+    @Transient
+    private PluginFilterConfigSchema configSchema;
+}

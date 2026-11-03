@@ -35,7 +35,7 @@ import okhttp3.Request;
 import okhttp3.RequestBody;
 import okhttp3.Response;
 import org.apache.commons.lang3.StringUtils;
-import org.springframework.boot.web.client.RestTemplateBuilder;
+import org.springframework.boot.restclient.RestTemplateBuilder;
 import org.springframework.core.ParameterizedTypeReference;
 import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
@@ -43,6 +43,7 @@ import org.springframework.http.HttpMethod;
 import org.springframework.stereotype.Service;
 import org.springframework.util.LinkedMultiValueMap;
 import org.springframework.util.MultiValueMap;
+import org.springframework.web.client.HttpClientErrorException;
 import org.springframework.web.client.RestTemplate;
 import org.springframework.web.servlet.support.ServletUriComponentsBuilder;
 import org.springframework.web.util.UriComponentsBuilder;
@@ -54,6 +55,7 @@ import java.util.Comparator;
 import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
@@ -71,6 +73,11 @@ public class EmbyService {
     private final AppProperties appProperties;
     private final ProxyService proxyService;
     private final Cache<Integer, EmbyInfo> cache = Caffeine.newBuilder().build();
+    // route case of the episodes endpoint varies across servers: some only accept the
+    // lower-case form (#950, emos.lol), case-sensitive servers only the official /Shows/ form (#1089)
+    private static final String SHOWS_PATH_LOWER = "/shows/";
+    private static final String SHOWS_PATH_UPPER = "/Shows/";
+    private final Cache<Integer, String> showsPathCache = Caffeine.newBuilder().build();
     private final OkHttpClient okHttpClient = new OkHttpClient();
 
     private final List<FilterValue> filters = Arrays.asList(
@@ -122,7 +129,7 @@ public class EmbyService {
         int i = 1;
         List<Emby> list = embyRepository.findAll();
         for (Emby emby : list) {
-            emby.setOrder(i++);
+            emby.setSortOrder(i++);
         }
         embyRepository.saveAll(list);
         settingRepository.save(new Setting("fix_emby_order", "true"));
@@ -156,7 +163,7 @@ public class EmbyService {
 
     public List<Emby> findAll() {
         List<Emby> list = new ArrayList<>(embyRepository.findAll());
-        list.sort(Comparator.comparing(Emby::getOrder));
+        list.sort(Comparator.comparing(Emby::getSortOrder));
         return list;
     }
 
@@ -290,13 +297,13 @@ public class EmbyService {
             movie.setVod_tag(FOLDER);
         }
         movie.setVod_director(emby.getName());
-        movie.setVod_remarks(Objects.toString(item.getRating(), null));
+        movie.setVod_remarks(formatRating(item.getRating()));
         movie.setVod_year(Objects.toString(item.getYear(), null));
         return movie;
     }
 
     public MovieList detail(String tid) throws JsonProcessingException {
-        String[] parts = tid.split("-");
+        String[] parts = tid.split("-", 2);
         Emby emby = embyRepository.findById(Integer.parseInt(parts[0])).orElseThrow(() -> new NotFoundException("站点不存在"));
         var info = getEmbyInfo(emby);
         HttpHeaders headers = setHeaders(emby, info);
@@ -334,9 +341,9 @@ public class EmbyService {
             if (!urls.isEmpty()) {
                 names.add(name);
                 playUrl.add(String.join("#", urls));
+                movie.setVod_play_from(String.join("$$$", names));
+                movie.setVod_play_url(String.join("$$$", playUrl));
             }
-            movie.setVod_play_from(String.join("$$$", names));
-            movie.setVod_play_url(String.join("$$$", playUrl));
         }
         result.getList().add(movie);
 
@@ -353,7 +360,7 @@ public class EmbyService {
         int id = proxyService.generateImageUrl(url, referer);
         // nginx https
         return ServletUriComponentsBuilder.fromCurrentRequest()
-                .scheme(appProperties.isEnableHttps() && !Utils.isLocalAddress() ? "https" : "http") // nginx https
+                .scheme(Utils.publicScheme(appProperties.isEnableHttps())) // nginx https
                 .replacePath("/images/" + id)
                 .replaceQuery("")
                 .build()
@@ -363,9 +370,24 @@ public class EmbyService {
     private List<EmbyItem> getAll(Emby emby, EmbyInfo info, String sid) {
         HttpHeaders headers = setHeaders(emby, info);
         HttpEntity<Object> entity = new HttpEntity<>(null, headers);
-        String url = emby.getUrl() + "/emby/Users/" + info.getUser().getId() + "/Items?ParentId=" + sid + "&Filters=IsNotFolder&Recursive=true&Limit=2000&Fields=Chapters,ProductionYear,PremiereDate&ExcludeLocationTypes=Virtual&EnableTotalRecordCount=false&CollapseBoxSetItems=false";
-        var items = restTemplate.exchange(url, HttpMethod.GET, entity, EmbyItems.class).getBody();
-        return items.getItems();
+        String path = showsPathCache.get(emby.getId(), k -> SHOWS_PATH_LOWER);
+        String url = emby.getUrl() + "/emby" + path + sid + "/Episodes";
+        try {
+            var items = restTemplate.exchange(url, HttpMethod.GET, entity, EmbyItems.class).getBody();
+            return items.getItems();
+        } catch (HttpClientErrorException.NotFound e) {
+            String fallback = SHOWS_PATH_LOWER.equals(path) ? SHOWS_PATH_UPPER : SHOWS_PATH_LOWER;
+            log.warn("Episodes endpoint {} returned 404, retrying with {}", path, fallback);
+            url = emby.getUrl() + "/emby" + fallback + sid + "/Episodes";
+            try {
+                var items = restTemplate.exchange(url, HttpMethod.GET, entity, EmbyItems.class).getBody();
+                showsPathCache.put(emby.getId(), fallback);
+                return items.getItems();
+            } catch (HttpClientErrorException.NotFound e2) {
+                showsPathCache.invalidate(emby.getId());
+                throw e;
+            }
+        }
     }
 
     public MovieList search(String wd) {
@@ -393,8 +415,25 @@ public class EmbyService {
         try {
             HttpHeaders headers = setHeaders(emby, info);
             HttpEntity<Object> entity = new HttpEntity<>(null, headers);
-            String url = emby.getUrl() + "/emby/Users/" + info.getUser().getId() + "/Items?IncludePeople=false&IncludeMedia=true&IncludeGenres=false&IncludeStudios=false&IncludeArtists=false&IncludeItemTypes=" + type + "&Limit=30&Fields=PrimaryImageAspectRatio,BasicSyncInfo,ProductionYear,CommunityRating&Recursive=true&EnableTotalRecordCount=false&ImageTypeLimit=1&searchTerm=" + wd;
-            var response = restTemplate.exchange(url, HttpMethod.GET, entity, EmbyItems.class).getBody();
+            // official parameter name is SearchTerm; some proxied sites bind query names case-sensitively
+            // and silently drop the lower-case searchTerm form
+            var uri = UriComponentsBuilder.fromUriString(emby.getUrl() + "/emby/Users/" + info.getUser().getId() + "/Items")
+                    .queryParam("IncludePeople", "false")
+                    .queryParam("IncludeMedia", "true")
+                    .queryParam("IncludeGenres", "false")
+                    .queryParam("IncludeStudios", "false")
+                    .queryParam("IncludeArtists", "false")
+                    .queryParam("IncludeItemTypes", type)
+                    .queryParam("Limit", "30")
+                    .queryParam("Fields", "PrimaryImageAspectRatio,BasicSyncInfo,ProductionYear,CommunityRating")
+                    .queryParam("Recursive", "true")
+                    .queryParam("EnableTotalRecordCount", "false")
+                    .queryParam("ImageTypeLimit", "1")
+                    .queryParam("SearchTerm", wd)
+                    .encode()
+                    .build()
+                    .toUri();
+            var response = restTemplate.exchange(uri, HttpMethod.GET, entity, EmbyItems.class).getBody();
             for (var item : response.getItems()) {
                 var movie = getSearchDetail(item, emby);
                 list.add(movie);
@@ -421,9 +460,24 @@ public class EmbyService {
             }
             movie.setVod_pic(cover);
         }
-        movie.setVod_remarks(emby.getName() + " " + Objects.toString(item.getRating(), ""));
+        movie.setVod_remarks(formatSearchRating(emby.getName(), item.getRating()));
         movie.setVod_year(Objects.toString(item.getYear(), null));
         return movie;
+    }
+
+    private String formatRating(Double rating) {
+        if (rating == null || rating <= 0) {
+            return "";
+        }
+        return String.format(Locale.US, "%.1f", rating);
+    }
+
+    private String formatSearchRating(String name, Double rating) {
+        String value = formatRating(rating);
+        if (value.isEmpty()) {
+            return name;
+        }
+        return name + " " + value;
     }
 
     public MovieList list(String id, String sort, Integer pg) {
@@ -431,7 +485,7 @@ public class EmbyService {
         List<MovieDetail> list = new ArrayList<>();
 
         if (id.contains("-")) {
-            String[] parts = id.split("-");
+            String[] parts = id.split("-", 2);
             if (sort == null) {
                 sort = "DateCreated,SortName:Descending";
             }
@@ -444,7 +498,9 @@ public class EmbyService {
             if (parts.length == 2) {
                 var view = info.getViews().get(Integer.parseInt(parts[1]));
                 parentId = view.getId();
-                if (view.getCollectionType().equals("movies")) {
+                if (view.getCollectionType() == null) {
+                    type = "";
+                } else if (view.getCollectionType().equals("movies")) {
                     type = "Movie";
                 } else if (view.getCollectionType().equals("tvshows")) {
                     type = "Series";
@@ -571,7 +627,7 @@ public class EmbyService {
     }
 
     public Object play(String id) throws JsonProcessingException {
-        String[] parts = id.split("-");
+        String[] parts = id.split("-", 2);
         Emby emby = embyRepository.findById(Integer.parseInt(parts[0])).orElseThrow(() -> new NotFoundException("站点不存在"));
         var info = getEmbyInfo(emby);
         String ua = Constants.EMBY_USER_AGENT;
@@ -622,11 +678,11 @@ public class EmbyService {
         } catch (Exception e) {
             log.warn("start playing", e);
         }
-
+        String playPre = (emby.getUrl().contains("emos") || emby.getDeviceName().contains("emos")) ? "/emby" : "";
         List<String> urls = new ArrayList<>();
         for (var source : media.getItems()) {
             urls.add(source.getName());
-            urls.add(emby.getUrl() + source.getUrl());
+            urls.add(emby.getUrl() + playPre + source.getUrl());
         }
         Map<String, Object> result = new HashMap<>();
         result.put("url", urls);
@@ -668,7 +724,7 @@ public class EmbyService {
             log.debug("get Emby info: {} {} {} {}", emby.getId(), emby.getName(), emby.getUrl(), emby.getUsername());
             HttpHeaders headers = setHeaders(emby, null);
             HttpEntity<Object> entity = new HttpEntity<>(body, headers);
-            EmbyInfo info = restTemplate.exchange(emby.getUrl() + "/emby/Users/AuthenticateByName", HttpMethod.POST, entity, EmbyInfo.class).getBody();
+            EmbyInfo info = restTemplate.exchange(emby.getUrl() + "/emby/Users/AuthenticateByName?X-Emby-Client=" + emby.getClientName() + "&X-Emby-Device-Name=" + emby.getDeviceName() + "&X-Emby-Device-Id=" + emby.getDeviceId() + "&X-Emby-Client-Version=" + emby.getClientVersion(), HttpMethod.POST, entity, EmbyInfo.class).getBody();
             cache.put(emby.getId(), info);
 
             headers = setHeaders(emby, info);
